@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Python Regex Validator - Python Pack
+# Provides pack_validate_python() for the pack-loader pipeline.
+#
+# Rules: PY001-007, WARN-PY001
+# Requires: add_violation(), add_warning(), line_has_ignore(), FILE_PATH
+#   These are provided by the orchestrator (post-write-check.sh) before sourcing.
+#
+# NOTE: This file is source'd by pack-loader, NOT executed directly.
+#   Do NOT add set -euo pipefail - it would affect the sourcing script.
+# craftsman-ignore: SH001
+# =============================================================================
+
+# A rule that cannot run is not a rule that passed. Every check below that
+# needs python3 returned silently without it, so on a machine that has none the
+# pack reported every file clean and nothing said otherwise. Same shape as the
+# sqlite3 guard in metrics-db.sh. Announced once per process rather than once
+# per rule, because the point is to be noticed, not to be noisy.
+_PY_PACK_PY3_WARNED=""
+_py_pack_has_python3() {
+    command -v python3 >/dev/null 2>&1 && return 0
+    if [[ -z "${_PY_PACK_PY3_WARNED}" ]]; then
+        _PY_PACK_PY3_WARNED=1
+        echo "craftsman: python3 not found, PY001, PY002, PY006, PY007, GOD001 and NEST001 were not run" >&2
+    fi
+    return 1
+}
+
+_PY_PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_check_py001() {
+    local file="$1"
+    # Tokenised, not grepped: the regex read raw lines, so a docstring line
+    # starting with an English article looked like a two-letter variable and
+    # the rule blocked writes on prose.
+    _py_pack_has_python3 || return 0
+    local line_number
+    while IFS= read -r line_number; do
+        [[ -z "$line_number" ]] && continue
+        add_violation "PY001" "$line_number"
+    done < <(python3 "${_PY_PACK_DIR}/python_names.py" "$file" 2>/dev/null)
+}
+
+
+_check_py002() {
+    local file="$1"
+    _py_pack_has_python3 || return 0
+    local warning_message
+    while IFS= read -r warning_message; do
+        [[ -z "$warning_message" ]] && continue
+        add_violation "PY002" "$warning_message"
+    done < <(python3 -c "
+import ast, sys
+try:
+    tree = ast.parse(open(sys.argv[1]).read())
+except SyntaxError:
+    sys.exit(0)
+for node in ast.walk(tree):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        body_lines = node.end_lineno - node.lineno
+        if body_lines > 25:
+            print(f'line {node.lineno}: function {node.name}() is {body_lines} lines - consider extracting')
+" "$file" 2>/dev/null)
+}
+
+_check_py003() {
+    local file="$1"
+    local function_line
+    while IFS= read -r function_line; do
+        [[ -z "$function_line" ]] && continue
+        local lineno="${function_line%%:*}"
+        local content="${function_line#*:}"
+        if echo "$content" | grep -qE '^\s*def\s+[^_]' 2>/dev/null; then
+            if ! echo "$content" | grep -q '\->' 2>/dev/null; then
+                add_warning "PY003" "line ${lineno}: Public function missing return type hint"
+            fi
+        fi
+    done < <(grep -nE '^\s*def\s+' "$file" 2>/dev/null)
+}
+
+_check_py004() {
+    local file="$1"
+    local bare_except_line
+    while IFS= read -r bare_except_line; do
+        [[ -z "$bare_except_line" ]] && continue
+        add_violation "PY004" "line ${bare_except_line}: Bare 'except:' - catch specific exceptions"
+    done < <(grep -nE '^\s*except\s*:' "$file" 2>/dev/null | cut -d: -f1)
+}
+
+_check_py005() {
+    local file="$1"
+    local mutable_default_line
+    while IFS= read -r mutable_default_line; do
+        [[ -z "$mutable_default_line" ]] && continue
+        add_violation "PY005" "line ${mutable_default_line}: Mutable default argument - use None + assignment"
+    done < <(grep -nE 'def\s+\w+\(.*=\s*(\[\]|\{\}|set\(\))' "$file" 2>/dev/null | cut -d: -f1)
+}
+
+_PY_AST_CHECKS="${_PY_PACK_DIR}/python_ast_checks.py"
+
+# PY006 and PY007 run their AST pass from python_ast_checks.py, next to this
+# file: the pack owns its analyser. It lived in hooks/lib for two releases,
+# where the core carried a Python checker no other pack could use, rather
+# than from a heredoc: inline, they pushed this file past its structural budget
+# and put the logic beyond the reach of ruff and of the test suite.
+# The check name is passed lowercased by the caller rather than derived with
+# ${rule,,}: that expansion needs bash 4, and macOS still ships bash 3.2.
+_check_py_ast() {
+    local rule="$1" check="$2" file="$3" message
+    _py_pack_has_python3 || return 0
+    while IFS= read -r message; do
+        [[ -z "$message" ]] && continue
+        add_warning "$rule" "$message"
+    done < <(python3 "$_PY_AST_CHECKS" "$check" "$file" 2>/dev/null)
+}
+
+_check_py006() {
+    _check_py_ast "PY006" "py006" "$1"
+}
+
+_check_py007() {
+    _check_py_ast "PY007" "py007" "$1"
+}
+
+_check_warn_py001() {
+    local file="$1"
+    # Commas inside the parameter list only: `[^,)]` stops at the closing
+    # parenthesis, so a return annotation's `tuple[str, list[str]]` no longer
+    # counts as parameters (CR-210).
+    if grep -qE 'def\s+\w+\(([^,)]+,){3,}' "$file" 2>/dev/null; then
+        add_warning "WARN-PY001" "Function with 4+ parameters - consider refactoring to dataclass/object"
+    fi
+}
+
+_check_god001() {
+    local file="$1"
+    _py_pack_has_python3 || return 0
+    local message
+    while IFS= read -r message; do
+        [[ -z "$message" ]] && continue
+        add_violation "GOD001" "$message"
+    done < <(python3 -c "
+import ast, sys
+try:
+    tree = ast.parse(open(sys.argv[1]).read())
+except SyntaxError:
+    sys.exit(0)
+for node in ast.walk(tree):
+    if isinstance(node, ast.ClassDef):
+        span = (node.end_lineno or node.lineno) - node.lineno
+        if span > 300:
+            print(f'line {node.lineno}: class {node.name} spans {span} lines (max 300): too many responsibilities, extract collaborators')
+" "$file" 2>/dev/null)
+}
+
+_check_nest001() {
+    local file="$1"
+    _py_pack_has_python3 || return 0
+    local message
+    while IFS= read -r message; do
+        [[ -z "$message" ]] && continue
+        add_violation "NEST001" "$message"
+    done < <(python3 -c "
+import ast, sys
+CTRL = (ast.If, ast.For, ast.While, ast.With, ast.AsyncFor, ast.AsyncWith, ast.Try)
+def depth(node, level=0):
+    here = level + 1 if isinstance(node, CTRL) else level
+    best = here
+    for child in ast.iter_child_nodes(node):
+        best = max(best, depth(child, here))
+    return best
+try:
+    tree = ast.parse(open(sys.argv[1]).read())
+except SyntaxError:
+    sys.exit(0)
+for node in ast.walk(tree):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        deepest = max((depth(child, 0) for child in ast.iter_child_nodes(node)), default=0)
+        if deepest >= 3:
+            print(f'line {node.lineno}: function {node.name}() nests control flow {deepest} levels deep: extract a method or use guard clauses')
+" "$file" 2>/dev/null)
+}
+
+pack_validate_python() {
+    local file="$1"
+    _check_py001 "$file"
+    _check_py002 "$file"
+    _check_py003 "$file"
+    _check_py004 "$file"
+    _check_py005 "$file"
+    _check_py006 "$file"
+    _check_py007 "$file"
+    _check_warn_py001 "$file"
+    _check_god001 "$file"
+    _check_nest001 "$file"
+}

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Install through Grok's native plugin manager. Compatibility wiring is opt-in.
+set -euo pipefail
+_self="${BASH_SOURCE[0]}"
+while [[ -L "$_self" ]]; do
+    _target=$(readlink "$_self")
+    [[ "$_target" == /* ]] && _self="$_target" || _self="$(dirname "$_self")/$_target"
+done
+ROOT="$(cd "$(dirname "$_self")/.." && pwd)"
+MODE="${1:---native}"
+case "$MODE" in
+    --native|--compat-hooks) ;;
+    *) echo "Usage: craftsman-grok-install [--native|--compat-hooks]" >&2; exit 2 ;;
+esac
+# Installing trusts this checkout for every future Grok session, so say which
+# one before doing it.
+origin=$(git -C "$ROOT" remote get-url origin 2>/dev/null || echo "no origin")
+commit=$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo "not a git checkout")
+echo "Installing craftsman from ${ROOT} (${origin}, ${commit})"
+# Already installed from this checkout is read from `grok plugin list --json`,
+# a documented machine-readable contract, not from an error message's wording.
+here=$(cd "$ROOT" && pwd -P)
+installed=$(grok plugin list --json 2>/dev/null | jq -r --arg here "$here" \
+    '[.[]? | select(.name == "craftsman" and .source == $here)] | length' 2>/dev/null || echo 0)
+if [[ "${installed:-0}" -gt 0 ]]; then
+    echo "craftsman is already installed from ${here}; refreshing the gate only."
+else
+    grok plugin install "$ROOT" --trust
+fi
+# Grok 1.0.40 does not execute plugin-bundled hooks, whether hooks.json is a
+# path or the handlers are inlined in the manifest (a fresh grok -p wrote the
+# file and an inline PreToolUse marker never ran). The gate that runs is this
+# global file. --native and --compat-hooks both write it; the flag remains so
+# older instructions still work. Global hooks need no extra trust.
+bash "$ROOT/ci/craftsman-ci.sh" export --target grok-hooks --into "${HOME}/.grok/hooks"
+echo "Write gate: ${HOME}/.grok/hooks/craftsman.json"
+echo "Grok 1.0.40 does not run plugin-bundled hooks. This file is the gate."

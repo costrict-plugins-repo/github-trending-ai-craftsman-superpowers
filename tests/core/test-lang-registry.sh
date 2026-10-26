@@ -1,0 +1,609 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Language registry tests - the file-to-validator routing must come from the
+# loaded packs, never from a literal in the engine.
+#
+# Every assertion here is paired with a known-good control that exercises the
+# same harness on a language the engine already knows. Without the control, a
+# red result cannot be told apart from a broken fixture, and a green one cannot
+# be told apart from a test that never ran the tool.
+#
+# These are expected to FAIL until the registry lands. That is the point: a
+# guard never seen red proves nothing.
+# =============================================================================
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+source "$SCRIPT_DIR/../lib/test-helpers.sh"
+
+export CLAUDE_PLUGIN_ROOT="$ROOT_DIR"
+setup_test_env
+backup_home_bridges
+
+TMPDIR_BASE="/tmp/craftsman-lang-registry-$$"
+PROJECT_DIR="$TMPDIR_BASE/project/src"
+mkdir -p "$PROJECT_DIR"
+
+_ORIG_HOME="$HOME"
+export HOME="$TMPDIR_BASE/home"
+mkdir -p "$HOME/.claude"
+
+cleanup() {
+    cd "$ROOT_DIR" || true
+    export HOME="$_ORIG_HOME"
+    restore_home_bridges
+    cleanup_test_env
+    rm -rf "$TMPDIR_BASE"
+}
+trap cleanup EXIT
+
+# hook_exit <file> - run post-write-check against a path, return its exit code
+hook_exit() {
+    local target="$1"
+    printf '{"tool_name":"Write","tool_input":{"file_path":"%s"}}' "$target" \
+        | bash "$ROOT_DIR/hooks/post-write-check.sh" >/dev/null 2>&1
+    echo $?
+}
+
+# hook_output <file> - run post-write-check against a path, return its stdout
+hook_output() {
+    local target="$1"
+    printf '{"tool_name":"Write","tool_input":{"file_path":"%s"}}' "$target" \
+        | bash "$ROOT_DIR/hooks/post-write-check.sh" 2>/dev/null
+}
+
+echo "=== Language Registry Tests ==="
+
+# --- Fixtures -----------------------------------------------------------------
+# A deliberately non-compliant PHP file: no strict_types, non-final class with a
+# public setter. It is the control subject, so it must stay in breach of a rule
+# the engine blocks on today.
+cat > "$PROJECT_DIR/Dirty.php" <<'PHP'
+<?php
+
+class Dirty
+{
+    public $name;
+
+    public function setName($name)
+    {
+        $this->name = $name;
+    }
+}
+PHP
+
+# Clean PHP: present only to make FILES_DISCOVERED non-zero, so the CI parity
+# test reproduces the dangerous case (a mixed repository) rather than the benign
+# one where the "no source file was found" guard already speaks up.
+cat > "$PROJECT_DIR/Clean.php" <<'PHP'
+<?php
+
+declare(strict_types=1);
+
+final class Clean
+{
+    private function __construct(private readonly string $name)
+    {
+    }
+
+    public static function create(string $name): self
+    {
+        return new self($name);
+    }
+}
+PHP
+
+cat > "$PROJECT_DIR/bad.py" <<'PY'
+def collect(items=[]):
+    try:
+        return items
+    except:
+        return None
+PY
+
+cat > "$PROJECT_DIR/bad.sh" <<'SH'
+#!/usr/bin/env bash
+echo "no safety options set"
+SH
+
+cat > "$PROJECT_DIR/service.go" <<'GO'
+package main
+
+func main() {
+	panic("deliberately in breach of GO001")
+}
+GO
+
+# --- External pack declaring a language ---------------------------------------
+EXT_PACK_DIR="$TMPDIR_BASE/ext-go"
+mkdir -p "$EXT_PACK_DIR/hooks"
+cat > "$EXT_PACK_DIR/pack.yml" <<'YAML'
+name: go
+version: "1.0.0"
+description: "Go craftsman pack"
+compatibility:
+  core: ">=2.6.0"
+  stack: ["*"]
+languages:
+  - id: go
+    extensions: ["go"]
+    entry_markers: ["go.mod"]
+    protected_configs: ["golangci.yml"]
+    # Deliberately not `go test`: that string is already in the hook's literal
+    # list, so it would pass whether or not the registry is consulted.
+    test_commands: ["gotestsum"]
+    lsp: "gopls"
+    validators: ["hooks/go-validator.sh"]
+    metrics_dialect: c-like
+rules:
+  builtin: ["GO001"]
+hooks:
+  validators: ["hooks/go-validator.sh"]
+commands:
+  scaffold_types: []
+YAML
+
+cat > "$EXT_PACK_DIR/hooks/go-validator.sh" <<'BASH'
+#!/usr/bin/env bash
+pack_validate_go() {
+    local file="$1"
+    if grep -q 'panic(' "$file" 2>/dev/null; then
+        add_violation "GO001" "panic() in production code - return an error"
+    fi
+}
+BASH
+
+cat > "$HOME/.claude/.craft-config.yml" <<YAML
+stack: fullstack
+packs:
+  external:
+    - path: "$EXT_PACK_DIR"
+YAML
+
+cd "$TMPDIR_BASE/project" || exit 1
+
+# =============================================================================
+# Group A - a language contributed by a pack is routed to its validator
+# =============================================================================
+echo ""
+echo "--- A. Pack-contributed language reaches its validator ---"
+
+php_code=$(hook_exit "$PROJECT_DIR/Dirty.php")
+if [[ "$php_code" == "2" ]]; then
+    log_pass "control: the hook blocks a non-compliant PHP file (exit 2)"
+
+    go_code=$(hook_exit "$PROJECT_DIR/service.go")
+    if [[ "$go_code" == "2" ]]; then
+        log_pass "a .go file reaches pack_validate_go and blocks on GO001"
+    else
+        log_fail "pack-contributed language routed" \
+            "expected exit 2 on service.go, got $go_code - the engine's extension list does not include a language its loaded packs declare"
+    fi
+else
+    log_fail "control: hook does not block a non-compliant PHP file" \
+        "expected exit 2, got $php_code - the routing assertion below is undetermined, not green"
+fi
+
+# The validator being callable is not the same as it being called. The old test
+# asserted only the former, which is why it stayed green while the feature was
+# dead.
+source "$ROOT_DIR/hooks/lib/config.sh"
+source "$ROOT_DIR/hooks/lib/pack-loader.sh"
+_pack_reset
+pack_loader_init "$TMPDIR_BASE/no-internal-packs"
+if type pack_validate_go &>/dev/null; then
+    log_pass "control: pack_validate_go is defined after loading (necessary, not sufficient)"
+else
+    log_fail "control: external pack did not load" "pack_validate_go undefined"
+fi
+
+# =============================================================================
+# Group B - the pipeline sees every file the hook sees
+# =============================================================================
+echo ""
+echo "--- B. Hook and CI agree on which files are validated ---"
+
+ci_output=$(bash "$ROOT_DIR/ci/craftsman-ci.sh" src 2>&1)
+
+if assert_produced_output "craftsman-ci" "$ci_output"; then
+    if echo "$ci_output" | grep -qiE 'PHP[0-9]{3}|LAYER[0-9]{3}'; then
+        log_pass "control: CI reports violations on the non-compliant PHP file"
+
+        py_hook_code=$(hook_exit "$PROJECT_DIR/bad.py")
+        if [[ "$py_hook_code" == "2" ]]; then
+            log_pass "control: the hook blocks bad.py (PY004/PY005)"
+
+            if echo "$ci_output" | grep -qE 'PY00[0-9]'; then
+                log_pass "CI reports the same Python violations the hook blocks on"
+            else
+                log_fail "hook/CI parity on Python" \
+                    "hook exits 2 on bad.py, CI reports no PY rule - the pipeline never discovered the file"
+            fi
+        else
+            log_fail "control: hook does not block bad.py" \
+                "expected exit 2, got $py_hook_code - the parity assertion is undetermined"
+        fi
+
+        # A single PHP file must not silence the empty-gate guard for the other
+        # languages present. FILES_DISCOVERED counting only php|ts|tsx is what
+        # turns a mixed repository into a silent pass.
+        # Take the number immediately before "file(s)". Reading the first
+        # integer on the line picks up the violation count instead, which made
+        # this assertion pass for the wrong reason the first time it went green.
+        scanned_line=$(echo "$ci_output" | grep -iE '[0-9]+ file\(s\)' | head -1)
+        scanned_count=$(echo "$scanned_line" \
+            | grep -oE '[0-9]+ file\(s\)' | grep -oE '^[0-9]+')
+        if [[ -n "$scanned_count" && "$scanned_count" -ge 5 ]]; then
+            log_pass "CI counts every file a loaded pack claims (got $scanned_count)"
+        else
+            log_fail "CI file discovery covers loaded packs" \
+                "reported '${scanned_line:-nothing}' for 5 claimed files - Python, Bash and Go were never discovered"
+        fi
+    else
+        log_fail "control: CI reports nothing on a non-compliant PHP file" \
+            "the CI harness itself is not working, so the parity assertions below are undetermined"
+    fi
+fi
+
+# =============================================================================
+# Group C - severity is resolved by the rules engine, for every rule
+# =============================================================================
+echo ""
+echo "--- C. Rule severity honours project configuration ---"
+
+# Control: a rule that already flows through add_violation must obey an
+# `ignore` override. This proves the rules engine is wired into the hook.
+cat > "$TMPDIR_BASE/project/.craft-rules.yml" <<'YAML'
+rules:
+  PHP001: ignore
+  PHP002: ignore
+  PHP003: ignore
+  PHP004: ignore
+  PHP005: ignore
+  LAYER001: ignore
+  LAYER002: ignore
+  LAYER003: ignore
+  LAYER004: ignore
+YAML
+
+php_ignored_code=$(hook_exit "$PROJECT_DIR/Dirty.php")
+if [[ "$php_ignored_code" == "0" ]]; then
+    log_pass "control: an 'ignore' override in .craft-rules.yml suppresses a blocking rule"
+else
+    log_fail "control: rules engine override has no effect" \
+        "expected exit 0 with every PHP rule ignored, got $php_ignored_code - Group C assertions are undetermined"
+fi
+
+# SH001 is declared a blocking rule in ci/doctrine-export.sh but emitted through
+# add_warning, which never consults the rules engine. Promoting it must work.
+cat > "$TMPDIR_BASE/project/.craft-rules.yml" <<'YAML'
+rules:
+  SH001: block
+YAML
+
+sh_block_code=$(hook_exit "$PROJECT_DIR/bad.sh")
+if [[ "$sh_block_code" == "2" ]]; then
+    log_pass "SH001 promoted to block by .craft-rules.yml actually blocks"
+else
+    log_fail "warning-severity rules are configurable" \
+        "expected exit 2 with SH001: block, got $sh_block_code - add_warning bypasses rules_severity_for_file, so user configuration has no purchase on it"
+fi
+
+cat > "$TMPDIR_BASE/project/.craft-rules.yml" <<'YAML'
+rules:
+  SH001: ignore
+YAML
+
+sh_ignore_output=$(hook_output "$PROJECT_DIR/bad.sh")
+if echo "$sh_ignore_output" | grep -q 'SH001'; then
+    log_fail "warning-severity rules honour ignore" \
+        "SH001 still reported after being set to ignore - the same bypass, in the other direction"
+else
+    log_pass "SH001 set to ignore is no longer reported"
+fi
+
+# =============================================================================
+# Group D - capabilities a manifest declares are actually consumed
+#
+# A capability that is parsed and indexed but that no consumer reads is not a
+# feature, it is a field. These assertions are written against the consumer.
+# =============================================================================
+echo ""
+echo "--- D. Declared capabilities reach their consumer ---"
+
+export CLAUDE_PLUGIN_DATA="$TMPDIR_BASE/plugin-data"
+mkdir -p "$CLAUDE_PLUGIN_DATA"
+FAILURE_LOG="$CLAUDE_PLUGIN_DATA/test-failures.log"
+
+# run_failing_test <command> - feed a failed Bash run to the verification hook,
+# in the shape Claude Code sends one (a PostToolUseFailure whose `error` names
+# the exit code; tests/fixtures/hosts/claude-code). The `tool_result.exit_code`
+# this used to send is a field no host sends.
+run_failing_test() {
+    printf '{"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_input":{"command":"%s"},"error":"Exit code 1\\nFAILED","is_interrupt":false}' "$1" \
+        | bash "$ROOT_DIR/hooks/post-bash-test-verify.sh" >/dev/null 2>&1
+    return 0
+}
+
+: > "$FAILURE_LOG"
+run_failing_test "pytest tests/"
+if grep -q 'pytest' "$FAILURE_LOG" 2>/dev/null; then
+    log_pass "control: a failing known test command is recorded (ADR-0023 loop is live)"
+
+    : > "$FAILURE_LOG"
+    run_failing_test "gotestsum ./..."
+    if grep -q 'gotestsum' "$FAILURE_LOG" 2>/dev/null; then
+        log_pass "test_commands declared by a pack drive the verification loop"
+    else
+        log_fail "test_commands is consumed" \
+            "a pack declares 'gotestsum' and the hook ignored it - the deterministic verification loop is blind to every language whose runner is not in its literal list"
+    fi
+else
+    log_fail "control: the verification hook records nothing" \
+        "even for pytest - the Group D assertions are undetermined"
+fi
+
+# protected_configs: relaxing a quality gate's own config must be refused, and
+# which files those are is the packs' knowledge, not the hook's.
+run_config_protection() {
+    printf '{"tool_name":"Write","tool_input":{"file_path":"%s"}}' "$1" \
+        | bash "$ROOT_DIR/hooks/config-protection.sh" >/dev/null 2>&1
+    echo $?
+}
+
+touch "$PROJECT_DIR/phpstan.neon" "$PROJECT_DIR/golangci.yml"
+php_cfg_code=$(run_config_protection "$PROJECT_DIR/phpstan.neon")
+if [[ "$php_cfg_code" == "2" ]]; then
+    log_pass "control: writing phpstan.neon is refused (config protection is live)"
+
+    go_cfg_code=$(run_config_protection "$PROJECT_DIR/golangci.yml")
+    if [[ "$go_cfg_code" == "2" ]]; then
+        log_pass "protected_configs declared by a pack are refused too"
+    else
+        log_fail "protected_configs is consumed" \
+            "a pack declares golangci.yml protected and the write was allowed (exit $go_cfg_code)"
+    fi
+else
+    log_fail "control: config protection does not refuse phpstan.neon" \
+        "got exit $php_cfg_code - the assertion below is undetermined"
+fi
+
+# =============================================================================
+# The manifest reader without PyYAML must agree with the one with it.
+#
+# lang_registry.py carries a hand-rolled fallback, so the manifest format has
+# two implementations and only one of them runs on a developer machine: PyYAML
+# is installed here and absent from the CI runner. The divergence is silent by
+# construction, because a wrong registry does not raise, it routes files to the
+# wrong language or to none, and the validators simply stop running.
+#
+# A trailing block sequence followed by another entry is the case that broke:
+# both real packs and fixtures are compared, so the next manifest to use the
+# `supersedes:` form documented in CLAUDE.md cannot lose a language quietly.
+# =============================================================================
+echo ""
+echo "=== The fallback manifest reader agrees with PyYAML ==="
+
+NOYAML_DIR="$TMPDIR_BASE/noyaml"
+mkdir -p "$NOYAML_DIR"
+cat > "$NOYAML_DIR/sitecustomize.py" <<'PY'
+import sys
+
+
+class _BlockYaml:
+    def find_spec(self, name, path=None, target=None):
+        if name == "yaml" or name.startswith("yaml."):
+            raise ImportError("PyYAML made unavailable for this test")
+        return None
+
+
+sys.meta_path.insert(0, _BlockYaml())
+PY
+
+registry_of() {
+    python3 "$ROOT_DIR/hooks/lib/lang_registry.py" "$1" 2>/dev/null
+}
+
+# craftsman-ignore: WARN-SH001 - PYTHONPATH here is a one-command environment
+# prefix, not a function-scoped variable: `local` would change what it means.
+registry_without_pyyaml() {
+    PYTHONPATH="$NOYAML_DIR" python3 "$ROOT_DIR/hooks/lib/lang_registry.py" "$1" 2>/dev/null
+}
+
+# Control. Every assertion below compares two readers, and if PyYAML is not
+# actually blocked they are the same reader and the comparison proves nothing.
+if PYTHONPATH="$NOYAML_DIR" python3 -c "import yaml" 2>/dev/null; then
+    log_fail "control: PyYAML was not blocked" \
+        "the fallback reader never ran, so the parity assertions below are undetermined, not green"
+elif ! python3 -c "import yaml" 2>/dev/null; then
+    # Not a failure and not a pass: with one reader installed there is nothing
+    # to compare. This is the CI runner's situation, which is also the only
+    # environment that runs the fallback for real, so the comparison lives on
+    # the machines that have both and has to be loud where it cannot run.
+    echo "  NOT RUN: PyYAML is absent, so both readers here are the fallback."
+    echo "           The manifest parity assertion did not execute."
+else
+    log_pass "control: PyYAML is present and can be blocked (both readers are reachable)"
+
+    MULTI_MANIFEST="$TMPDIR_BASE/multi-pack.yml"
+    cat > "$MULTI_MANIFEST" <<'YAML'
+name: multi
+languages:
+  - id: first
+    extensions: ["one"]
+    supersedes:
+      - tools/first-check=ONE001
+  - id: second
+    extensions: ["two"]
+    validators: ["hooks/second.sh"]
+YAML
+
+    PARITY_BROKEN=""
+    for manifest in "$MULTI_MANIFEST" "$ROOT_DIR"/packs/*/pack.yml; do
+        if [[ "$(registry_of "$manifest")" != "$(registry_without_pyyaml "$manifest")" ]]; then
+            PARITY_BROKEN="${PARITY_BROKEN} ${manifest#$ROOT_DIR/}"
+        fi
+    done
+
+    if [[ -z "$PARITY_BROKEN" ]]; then
+        log_pass "every manifest compiles to the same registry with and without PyYAML"
+    else
+        log_fail "the two manifest readers disagree" \
+            "on:${PARITY_BROKEN} - on a machine without PyYAML those languages are routed wrongly or not at all, and no validator says so"
+    fi
+fi
+
+# --- literal_syntax has a consumer, and the engine holds no extension table ---
+#
+# The capability exists so the ratchet blanks comments and strings by the
+# grammar a pack declares, never by an extension list in the core. A pack
+# fixture declaring `literal_syntax: hash` on an invented extension proves the
+# consumer reads it: `# if for while` measures complexity 0 with the
+# declaration and 3 without.
+LS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/craftsman-literal-syntax.XXXXXX")"
+mkdir -p "$LS_DIR/packs/zed" "$LS_DIR/project"
+cat > "$LS_DIR/packs/zed/pack.yml" <<'YML'
+name: zed
+version: 1.0.0
+description: literal syntax fixture
+compatibility:
+  stack: ["*"]
+languages:
+  - id: zed
+    extensions: [zed]
+    literal_syntax: hash
+YML
+printf 'fn go(a) {\n  # if for while\n  return a\n}\n' > "$LS_DIR/project/main.zed"
+
+_measure_zed() {
+    ( cd "$LS_DIR/project" && CLAUDE_PLUGIN_DATA="$LS_DIR/data-$1" bash -c "
+        source '$ROOT_DIR/hooks/lib/lang-registry.sh'
+        lang_registry_init '$LS_DIR/packs/zed/pack.yml' >/dev/null 2>&1
+        python3 '$ROOT_DIR/hooks/lib/ratchet.py' measure main.zed
+    " 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["complexity"])' 2>/dev/null )
+}
+with_syntax=$(_measure_zed with)
+sed -i.bak '/literal_syntax/d' "$LS_DIR/packs/zed/pack.yml"
+without_syntax=$(_measure_zed without)
+if [[ "$with_syntax" == "0" && "$without_syntax" == "3" ]]; then
+    log_pass "literal_syntax is read by the ratchet (0 with the declaration, 3 without)"
+else
+    log_fail "literal_syntax is read by the ratchet" "with=$with_syntax without=$without_syntax"
+fi
+
+# A capability key the engine does not know is refused at compile time, by
+# name, and the whole language entry is dropped: `lang_registry.py` used to
+# skip it silently, so a pack could declare `fake_cap: [x]` and every test in
+# this file stayed green while CLAUDE.md claimed the opposite (architecture
+# review, MUST-FIX). A typo in `extensions` would have been a language that
+# validates nothing, with no word said.
+printf '    fake_cap: [x]\n' >> "$LS_DIR/packs/zed/pack.yml"
+unknown_key=$( python3 "$ROOT_DIR/hooks/lib/lang_registry.py" "$LS_DIR/packs/zed/pack.yml" 2>&1 >/dev/null )
+assert_contains "an unknown capability key is refused by name" "$unknown_key" "fake_cap"
+unknown_compiled=$( python3 "$ROOT_DIR/hooks/lib/lang_registry.py" "$LS_DIR/packs/zed/pack.yml" 2>/dev/null | grep -c "^zed" || true )
+if [[ "${unknown_compiled:-0}" -eq 0 ]]; then
+    log_pass "and the language entry carrying it is not compiled"
+else
+    log_fail "and the language entry carrying it is not compiled" "$unknown_compiled row(s) for zed"
+fi
+sed -i.bak '/fake_cap/d' "$LS_DIR/packs/zed/pack.yml"
+
+# An unknown grammar name is refused at compile time, by name, and the entry
+# is dropped rather than passed through. The compiler is asked directly: the
+# shell wrapper discards its stderr on purpose (a repository's manifest must
+# not corrupt a hook's output), so the refusal is read where it is written.
+printf '    literal_syntax: klingon\n' >> "$LS_DIR/packs/zed/pack.yml"
+refusal=$( python3 "$ROOT_DIR/hooks/lib/lang_registry.py" "$LS_DIR/packs/zed/pack.yml" 2>&1 >/dev/null )
+assert_contains "an unknown literal_syntax is refused by name" "$refusal" "klingon"
+compiled=$( python3 "$ROOT_DIR/hooks/lib/lang_registry.py" "$LS_DIR/packs/zed/pack.yml" 2>/dev/null | grep -c "literal_syntax" || true )
+if [[ "${compiled:-0}" -eq 0 ]]; then
+    log_pass "and the refused entry never reaches the registry"
+else
+    log_fail "and the refused entry never reaches the registry" "$compiled row(s) emitted"
+fi
+
+# No Python helper in the core may carry an extension table. The ratchet had
+# one for a single commit; this is the third-recurrence guard.
+literal_tables=$(grep -lE '"\.(py|ts|tsx|js|jsx|php|sh|go|rs)":' "$ROOT_DIR"/hooks/lib/*.py 2>/dev/null || true)
+if [[ -z "$literal_tables" ]]; then
+    log_pass "no core Python helper carries an extension table"
+else
+    log_fail "no core Python helper carries an extension table" "$literal_tables"
+fi
+rm -rf "$LS_DIR"
+
+# =============================================================================
+# metrics_dialect is the thing consumed
+# =============================================================================
+# The extractor accepted "php" and "ts" as spellings of a dialect, the two
+# validators passed their language name, and the `metrics_dialect` every pack
+# declares was read by nobody: the manifest could say anything. The extractor
+# now takes a dialect only, and structural_check_file asks the registry.
+echo ""
+echo "=== metrics_dialect is the thing consumed ==="
+dialect_refusal=$(python3 "$ROOT_DIR/hooks/lib/structural_metrics.py" "$ROOT_DIR/hooks/lib/structural.sh" php 2>&1 >/dev/null; echo "rc=$?")
+if echo "$dialect_refusal" | grep -q "rc=2" && echo "$dialect_refusal" | grep -q "not a metrics dialect"; then
+    log_pass "structural_metrics.py refuses a language name in place of a dialect (exit 2, named)"
+else
+    log_fail "structural_metrics.py refuses a language name in place of a dialect" "$dialect_refusal"
+fi
+if grep -qE 'structural_check_file "\$file" "(php|ts)"' "$ROOT_DIR"/packs/*/hooks/*.sh; then
+    log_fail "no validator names its language to the extractor" \
+        "$(grep -lE 'structural_check_file "\$file" "(php|ts)"' "$ROOT_DIR"/packs/*/hooks/*.sh | tr '\n' ' ')"
+else
+    log_pass "no validator names its language to the extractor: the registry decides the dialect"
+fi
+DIALECT_DIR="$(mktemp -d)"
+mkdir -p "$DIALECT_DIR/src"
+{
+    printf '<?php\nfinal class Big {\n    public function run(): void {\n'
+    for _ in $(seq 1 60); do printf '        $x = 1;\n'; done
+    printf '    }\n}\n'
+} > "$DIALECT_DIR/src/Big.php"
+dialect_findings=$(cd "$DIALECT_DIR" && CLAUDE_PLUGIN_DATA="$DIALECT_DIR/data" bash -c "
+    source '$ROOT_DIR/hooks/lib/config.sh'
+    source '$ROOT_DIR/hooks/lib/pack-loader.sh'
+    source '$ROOT_DIR/hooks/lib/structural.sh'
+    pack_loader_init >/dev/null 2>&1
+    add_violation() { printf '%s\n' \"\$1\"; }
+    structural_check_file '$DIALECT_DIR/src/Big.php'" 2>/dev/null)
+rm -rf "$DIALECT_DIR"
+if echo "$dialect_findings" | grep -q "LOC001"; then
+    log_pass "a 60-line PHP method reaches LOC001 through the dialect the symfony pack declares"
+else
+    log_fail "a 60-line PHP method reaches LOC001 through the dialect the symfony pack declares" "got '$dialect_findings'"
+fi
+
+echo ""
+echo "--- E. A poisoned cache is rebuilt, a failed compile leaves the previous one ---"
+# Independent verification (2026-09-15) found zero-line lang-known-*.tsv caches
+# from a compile that failed a month earlier and disabled every pack validator
+# for any hook reading them: pre-write saw no language and exited 0.
+REG_DATA=$(mktemp -d "${TMPDIR:-/tmp}/craftsman-reg-poison.XXXXXX")
+( export CLAUDE_PLUGIN_DATA="$REG_DATA" CLAUDE_PLUGIN_ROOT="$ROOT_DIR"
+  source "$ROOT_DIR/hooks/lib/config.sh"; source "$ROOT_DIR/hooks/lib/pack-loader.sh"; pack_loader_init >/dev/null 2>&1
+  for f in "$REG_DATA"/lang-known-*.tsv; do : > "$f"; done   # poison: keep the files, empty them
+  pack_loader_init >/dev/null 2>&1
+  lang_for_file /tmp/x/Order.php )
+if [[ "$( cd "$REG_DATA" && export CLAUDE_PLUGIN_DATA="$REG_DATA" CLAUDE_PLUGIN_ROOT="$ROOT_DIR"; source "$ROOT_DIR/hooks/lib/config.sh"; source "$ROOT_DIR/hooks/lib/pack-loader.sh"; pack_loader_init >/dev/null 2>&1; lang_for_file /tmp/x/Order.php )" == "php" ]] \
+    && [[ -s "$(ls "$REG_DATA"/lang-known-*.tsv | head -1)" ]]; then
+    log_pass "an empty registry cache is treated as stale and rebuilt; the language is known again"
+else
+    log_fail "poisoned cache" "$(ls -la "$REG_DATA" | grep lang-known | head -2 | tr '\n' ' ')"
+fi
+# a compile that fails must not replace the cache with nothing
+GOOD=$(ls "$REG_DATA"/lang-known-*.tsv | head -1); BEFORE=$(wc -l < "$GOOD" | tr -d ' ')
+( export CLAUDE_PLUGIN_DATA="$REG_DATA" CLAUDE_PLUGIN_ROOT="$ROOT_DIR"
+  source "$ROOT_DIR/hooks/lib/config.sh"; source "$ROOT_DIR/hooks/lib/lang-registry.sh"
+  touch "$ROOT_DIR/packs/python/pack.yml" 2>/dev/null   # a manifest newer than the cache: rebuild wanted
+  _LANG_REGISTRY_BUILDER=/bin/false _lang_registry_build_cache known "$ROOT_DIR"/packs/*/pack.yml >/dev/null 2>"$REG_DATA/err" )
+AFTER=$(wc -l < "$GOOD" | tr -d ' ')
+if [[ "$AFTER" == "$BEFORE" && "$AFTER" -gt 0 ]] && grep -q "could not be compiled" "$REG_DATA/err"; then
+    log_pass "a compile that fails leaves the previous registry in place and says so"
+else
+    log_fail "failed compile" "before=$BEFORE after=$AFTER err=$(cat "$REG_DATA/err" | head -1)"
+fi
+rm -rf "$REG_DATA"
+
+test_summary

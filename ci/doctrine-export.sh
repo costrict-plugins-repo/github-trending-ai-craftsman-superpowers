@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Doctrine Export - render the active rules as agent instruction files
+#
+# The rules engine stays the single source of truth. Other harnesses (Codex,
+# Copilot, Cursor, Gemini, Antigravity) read plain instruction files, so the
+# doctrine travels with the repository even where craftsman hooks cannot run.
+# Enforcement still happens where it always did: hooks locally, craftsman-ci
+# in the pipeline.
+#
+# Requires: rules_severity() from lib/rules-engine.sh (already sourced by
+# craftsman-ci.sh), config_stack(), config_strictness().
+# =============================================================================
+
+# Rule ids, their grouping and their wording used to be four constants and a
+# 38-branch case statement here, which meant a pack could not declare a rule it
+# enforces: a pack shipping DART001 had nowhere to put its id, its section or
+# its sentence. They now come from hooks/lib/rule-registry.sh, which compiles
+# rules/core.yml and the loaded packs' manifests.
+#
+# Analyser passthrough codes (PHPSTAN*, ESLINT*, DEPTRAC*) are deliberately
+# absent: their text is whatever the external tool says, not doctrine.
+
+_doctrine_emit_group() {
+    local title="$1" rules="$2" rule severity
+    local emitted=false
+    for rule in $rules; do
+        severity=$(rules_severity "$rule" 2>/dev/null || echo "block")
+        [[ "$severity" == "ignore" ]] && continue
+        if [[ "$emitted" == false ]]; then
+            printf '\n### %s\n\n' "$title"
+            emitted=true
+        fi
+        rule_never_ignorable "$rule" && severity="${severity}, no marker"
+        printf -- '- **%s** (%s): %s\n' "$rule" "$severity" "$(rule_text "$rule")"
+    done
+}
+
+_doctrine_header() {
+    local stack strictness
+    stack=$(config_stack 2>/dev/null || echo "other")
+    strictness=$(config_strictness 2>/dev/null || echo "strict")
+    cat <<HEADER
+# Engineering Doctrine
+
+Stack: ${stack} | Enforcement: ${strictness}
+
+These rules are enforced mechanically by the craftsman quality gate (locally on
+every write, and in CI on every push). Code that violates a \`block\` rule is
+rejected, so writing it costs a round trip.
+
+## Architecture
+
+Dependencies point inward: Domain imports nothing, Application imports Domain,
+Infrastructure and Presentation import Domain and Application. Persistence lives
+behind a repository interface owned by the Domain and implemented in
+Infrastructure.
+
+## Rules
+HEADER
+}
+
+_doctrine_footer() {
+    cat <<'FOOTER'
+
+## Practice
+
+- Design the domain before writing code; model behavior, not data bags.
+- Write the failing test first; never modify a test to make it pass.
+- Refactor only under a passing suite: run it before and after.
+- Never claim completion without the command output that proves it.
+- Suppress a rule inline only with `craftsman-ignore: <RULE_ID>` and a reason; a rule marked `no marker` takes none: fix the code.
+FOOTER
+}
+
+_doctrine_body() {
+    _doctrine_header
+    _doctrine_from_registry
+    _doctrine_footer
+}
+
+# A caller may source this file without having loaded the packs: `craftsman-ci
+# export` resolves the rules engine but not the loader. Building the registry on
+# demand keeps the export honest, because an empty doctrine reads as "nothing is
+# enforced" rather than as "the registry never ran".
+_doctrine_from_registry() {
+    type rule_groups &>/dev/null 2>&1 || return 1
+    if [[ -z "${CRAFTSMAN_RULE_REGISTRY:-}" ]] && type pack_loader_init &>/dev/null 2>&1; then
+        pack_loader_init 2>/dev/null || true
+    fi
+
+    local groups
+    groups=$(rule_groups 2>/dev/null)
+    if [[ -z "$groups" ]]; then
+        echo "craftsman: no rule registry, doctrine would be empty" >&2
+        return 1
+    fi
+
+    local group rules
+    while IFS= read -r group; do
+        [[ -z "$group" ]] && continue
+        rules=$(rules_in_group "$group" 2>/dev/null | tr '\n' ' ')
+        [[ -z "${rules// /}" ]] && continue
+        _doctrine_emit_group "$group" "$rules"
+    done <<< "$groups"
+    return 0
+}
+
+_doctrine_write_cursor() {
+    mkdir -p .cursor/rules
+    {
+        printf -- '---\ndescription: Craftsman engineering doctrine\nalwaysApply: true\n---\n\n'
+        printf '%s\n' "$1"
+    } > .cursor/rules/craftsman.mdc
+    echo "Created .cursor/rules/craftsman.mdc"
+}
+
+# The export owns ONE delimited block of the instruction file, never the file.
+# The real CLI run on an AGENTS.md holding a team's own instructions returned 0
+# and replaced the whole file (audit CR-117, C4), the worst moment being right
+# after a Codex import created it. Absent: the file is created with the block.
+# Present without the block: the block is appended, the text untouched.
+# Present with the block: only the block is rewritten. The begin marker carries
+# the provenance a reader needs to trust or regenerate it.
+DOCTRINE_BEGIN_RE='^<!-- craftsman:doctrine:begin'
+DOCTRINE_END='<!-- craftsman:doctrine:end -->'
+
+_doctrine_block() {
+    printf '<!-- craftsman:doctrine:begin version=%s generator=craftsman-ci -->\n' "${VERSION:-unknown}"
+    printf '<!-- Generated by craftsman-ci export. Edit outside these markers; run '"'"'craftsman-ci export'"'"' to regenerate the block. -->\n\n'
+    printf '%s\n\n' "$1"
+    printf '%s\n' "$DOCTRINE_END"
+}
+
+# _doctrine_write_block <file> <body>: the file with its craftsman block
+# replaced, appended or created; the rest of the file byte for byte, its line
+# endings and its mode included. A begin marker without its end, or an end
+# before its begin, is refused rather than guessed: the first cut paired an
+# orphan begin with the end of the block it had just appended and deleted
+# everything between them on the second export (review of 95c431e, F1). The
+# splice is python because BSD awk refuses a multi-line -v string.
+_doctrine_write_block() {
+    local file="$1" body="$2"
+    DOCTRINE_BLOCK="$(_doctrine_block "$body")" python3 "${CI_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/doctrine_splice.py" "$file" "$DOCTRINE_END"
+}
+
+# The plugin's agents as Codex roles (ci/agent_roles.py): mission text shared,
+# envelope translated, nothing of Claude Code's model or tool names transposed.
+# Written to the project's .codex/agents/ (documented); ~/.codex/agents/ is the
+# location observed loaded by `codex exec` 0.154.0, and the message says so.
+_doctrine_write_codex_agents() {
+    local here root into="${EXPORT_INTO:-.codex/agents}" pack extra=()
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    root="$(cd "$here/.." && pwd)"
+    # The loaded packs' agents, from the packs themselves: the symlinks under
+    # agents/ exist only after a SessionStart synced them (F8).
+    if type pack_loaded >/dev/null 2>&1; then
+        while IFS= read -r pack; do
+            [[ -n "$pack" && -d "$root/packs/$pack/agents" ]] && extra+=(--extra "$root/packs/$pack/agents")
+        done <<< "$(pack_loaded 2>/dev/null)"
+    fi
+    python3 "${CI_LIB_DIR:-$here}/agent_roles.py" codex "$root/agents" "$into" --version "${VERSION:-unknown}" --root "$root" ${extra[@]+"${extra[@]}"} || return 1
+    [[ "$into" == ".codex/agents" ]] && echo "On codex-cli 0.154.0 a project's .codex/agents/ was NOT offered to spawn_agent (documented, not observed); ~/.codex/agents/ was. To install there: craftsman-ci export --target codex-agents --into \"\$HOME/.codex/agents\""
+    return 0
+}
+
+# A host that discovers hooks/hooks.json and runs none of it (its capability
+# row declares gate_file) still runs a project or global hooks file. It is
+# written from the manifest, never by hand: a wiring typed a second time is a
+# wiring that drifts. A host with no gate_file is refused by host_hooks.py.
+_doctrine_write_host_hooks() {
+    local host="$1" here root into="${EXPORT_INTO:-}" out rel note
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    root="$(cd "$here/.." && pwd)"
+    rel=$(python3 "${CI_LIB_DIR:-$here}/host_hooks.py" --gate-rel "$root" "$host")
+    [[ -z "$into" ]] && into=$(dirname "${rel:-.}")
+    out="${into%/}/$(basename "${rel:-craftsman.json}")"
+    python3 "${CI_LIB_DIR:-$here}/host_hooks.py" "$host" "$root" "$out" || return 1
+    [[ "$(cd "$(dirname "$out")" && pwd -P)" == "$(cd "$HOME" && pwd -P)/$(dirname "$rel")" ]] && return 0
+    note=$(jq -r --arg h "$host" '.hosts[$h].gate_export.project_note // empty' "$root/hooks/host-capabilities.json" 2>/dev/null)
+    [[ -n "$note" ]] && echo "$note"
+    return 0
+}
+
+_doctrine_write_agents_md() {
+    _doctrine_write_block AGENTS.md "$1" || return 1
+    echo "Updated the craftsman block of AGENTS.md (read by Codex, Copilot, Cursor, Gemini, and other agents)"
+}
+
+_doctrine_write_copilot() {
+    mkdir -p .github
+    _doctrine_write_block .github/copilot-instructions.md "$1" || return 1
+    echo "Updated the craftsman block of .github/copilot-instructions.md"
+}
+
+# doctrine_export <target> - writes the instruction file(s) for a harness.
+doctrine_export() {
+    local target="${1:-agents-md}"
+    local body
+    body=$(_doctrine_body)
+
+    case "$target" in
+        agents-md)    _doctrine_write_agents_md "$body" ;;
+        cursor)       _doctrine_write_cursor "$body" ;;
+        copilot)      _doctrine_write_copilot "$body" ;;
+        codex-agents) _doctrine_write_codex_agents ;;
+        *-hooks)      _doctrine_write_host_hooks "${target%-hooks}" ;;
+        all)
+            doctrine_export agents-md && doctrine_export cursor && doctrine_export copilot
+            ;;
+        *)
+            echo "Unknown export target: $target. Use: agents-md, cursor, copilot, codex-agents, <host>-hooks for a host whose hooks/host-capabilities.json row declares gate_file (grok-hooks), all" >&2
+            return 2
+            ;;
+    esac
+}

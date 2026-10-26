@@ -1,0 +1,207 @@
+# Contributing to AI Craftsman Superpowers
+
+First off, thank you for considering contributing! This project aims to bring software craftsmanship practices to AI-assisted development.
+
+## Code of Conduct
+
+Be respectful, constructive, and professional. We're all here to build better tools.
+
+## How Can I Contribute?
+
+### Reporting Bugs
+
+Before creating bug reports, please check existing issues. When creating a report, include:
+
+- **Clear title** describing the issue
+- **Steps to reproduce** the behavior
+- **Expected behavior** vs what actually happened
+- **Claude Code version** and **plugin version**
+- **Relevant logs or screenshots**
+
+### Suggesting Enhancements
+
+We welcome feature requests! Please include:
+
+- **Use case**: What problem does this solve?
+- **Proposed solution**: How should it work?
+- **Alternatives considered**: What else did you think about?
+
+### Pull Requests
+
+1. **Fork** the repository
+2. **Create a branch** from `main`: `git checkout -b feature/my-feature`
+3. **Make your changes** following our standards (see below)
+4. **Test your changes** with real Claude Code usage
+5. **Commit** using [Conventional Commits](https://www.conventionalcommits.org/)
+6. **Push** and create a Pull Request
+
+## Development Standards
+
+### Command Development
+
+When creating or modifying commands:
+
+```yaml
+---
+name: command-name
+description: Clear, concise description of what the command does (shown in skill list).
+---
+
+# /craftsman:command-name - Title
+
+Clear instructions for Claude.
+
+## Process
+
+### Phase 1: [Name]
+...
+
+### Phase 2: [Name]
+...
+
+## Output Format
+...
+
+## Bias Protection
+...
+```
+
+### Security Review for New Commands/Agents/Skills
+
+Before submitting a new command, agent, or skill, check it for:
+
+- **Permission creep** - does it request tools/access beyond what its stated purpose needs? A read-only reviewer agent should not gain Write/Edit "just in case".
+- **Prompt injection surface** - if it reads external content (fetched URLs, indexed documents, third-party API responses), does the instruction text tell Claude to treat that content as data, not directives? See [Prompt Injection Defense Baseline](SECURITY.md#prompt-injection-defense-baseline).
+- **Blast radius** - can it be invoked in a way that silently does something destructive or expensive (network calls, `git push --force`, mass file rewrites)? If so, does it require explicit confirmation first?
+
+**Checklist for new commands:**
+- [ ] Clear `name` and `description` in frontmatter
+- [ ] Structured process with clear phases
+- [ ] Output format examples
+- [ ] Bias protection section
+- [ ] Example in `/examples/{command-name}/`
+- [ ] Tests in `/tests/core/`
+
+See [ADR-0007](docs/adr/0007-commands-over-skills.md) for the rationale behind the commands structure.
+
+### Code Standards
+
+Follow the craftsman principles this plugin promotes:
+
+**PHP:**
+- `final class` always
+- `declare(strict_types=1)` always
+- No public setters
+- Value Objects for domain primitives
+
+**TypeScript:**
+- No `any` types
+- `readonly` properties
+- Named exports only
+- Branded types for domain primitives
+
+**General:**
+- Self-documenting code (minimal comments)
+- Tests for behavior, not implementation
+- YAGNI - don't add features "just in case"
+
+### Commit Messages
+
+Use [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+type(scope): description
+
+feat(skill): add new RAG design skill
+fix(debug): correct ReAct loop detection
+docs(examples): add challenge code review example
+refactor(hooks): simplify bias detection logic
+test(design): add entity creation test case
+```
+
+Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
+
+### Testing
+
+**Manual Testing:**
+1. Install plugin locally: `/plugin install craftsman@/path/to/repo`
+2. Test each skill with example prompts from `/examples/`
+3. Verify expected behavior matches documentation
+
+**Automated Testing:**
+```bash
+# Run test suite
+./tests/run-tests.sh
+
+# Test specific command
+./tests/run-tests.sh --command design
+```
+
+## Project Structure
+
+```
+ai-craftsman-superpowers/
+├── .claude-plugin/             # Plugin manifest
+├── skills/                     # Workflows as skills/<name>/SKILL.md (invoked as /craftsman:<name>)
+├── agents/                     # Reviewers (5) + Craftsmen (7) = 12 agents
+├── hooks/                      # Automated validation (6 scripts + 4 agent hooks)
+├── knowledge/                  # Patterns & principles
+├── examples/                   # Usage examples
+├── tests/                      # Test suite
+├── docs/
+│   └── adr/                    # Architecture decisions
+└── CONTRIBUTING.md
+```
+
+## Getting Help
+
+- **Questions**: Open a [Discussion](https://github.com/BULDEE/ai-craftsman-superpowers/discussions)
+- **Bugs**: Open an [Issue](https://github.com/BULDEE/ai-craftsman-superpowers/issues)
+- **Chat**: [Discord community](https://discord.gg/eBpgHAGu)
+
+## Recognition
+
+Contributors are recognized in:
+- CONTRIBUTORS.md
+- Release notes
+- README acknowledgments
+
+Thank you for helping make AI-assisted development more rigorous!
+
+## Developper sans casser son installation
+
+Ne modifie jamais les fichiers du plugin installe dans `~/.claude/plugins/cache/`, et ne copie
+pas un fichier depuis ton depot vers cette installation. Dans les deux cas l'installation
+diverge du depot en silence, et tu finis par deboguer une version qui n'existe nulle part.
+
+**Utilise un marketplace local.** Il expose ton depot comme n'importe quel marketplace
+distant, mais depuis le disque, donc tu passes par le meme chemin d'installation qu'un
+utilisateur.
+
+Cree `.claude-plugin/marketplace.json` dans un dossier parent qui contient ton plugin :
+
+```json
+{
+  "name": "mon-marketplace-dev",
+  "owner": { "name": "Ton Nom" },
+  "plugins": [
+    { "name": "mon-plugin", "source": "./mon-plugin", "description": "..." }
+  ]
+}
+```
+
+Puis :
+
+```bash
+claude plugin marketplace add ~/chemin/vers/le/dossier
+/plugin install mon-plugin@mon-marketplace-dev
+/plugin marketplace update mon-marketplace-dev   # apres chaque modification
+```
+
+Une source locale doit commencer par `./` et rester sous la racine du marketplace : `../` est
+refuse. Les mises a jour automatiques sont desactivees pour un marketplace local, le
+rafraichissement est donc explicite.
+
+Interet reel : tu rencontres les memes bugs d'installation qu'un utilisateur, tu n'as aucun
+chemin absolu a declarer dans `settings.json`, et un manifeste malforme echoue chez toi avant
+d'echouer chez lui.

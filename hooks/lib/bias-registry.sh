@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Bias Pattern Registry (ADR-0030) - per-language bias patterns, owned by data.
+#
+# The engine knows the SHAPE of the pattern set and none of its content.
+# Adding the twentieth language is adding a twentieth conf file under
+# hooks/lib/bias-patterns/, with no edit here and none in bias-detector.sh.
+#
+# A conf file declares:
+#   BIAS_REGISTERED_LANGS+=("de")
+#   BIAS_DE_MODE="curated"        # or "signal"
+#   BIAS_DE_ACCELERATION="..."    # zero or more of the four categories
+#   BIAS_DE_TEST_DISMISSAL="..."  # the agent's own excuse for a red test,
+#                                 # read by test-dismissal-guard.sh (CR-289)
+#
+# curated: context-aware regex, precision earned, warns directly (systemMessage).
+# signal:  recall-oriented lexeme alternation; a hit produces an adjudication
+#          note for the main model, never a direct warning.
+#
+# Sourced by a `set -uo pipefail` hook: every indirect read is ${!name:-} so a
+# category a language does not declare reads as empty, never as an unbound
+# variable. Bash 3.2: no associative arrays anywhere.
+# =============================================================================
+
+BIAS_REGISTERED_LANGS=()
+# The variable suffix of each registered tag, index for index, derived once by
+# the audit. bias_combined_pattern runs on every prompt and at every Stop, and
+# deriving 13 suffixes inside it cost 13 subshells per call: 221 of them per
+# prompt, half of the bias detector's time.
+_BIAS_REGISTERED_SUFFIXES=()
+
+# Language tags are BCP 47 (RFC 5646): "fr", and equally "fr-CA", "pt-BR",
+# "zh-Hant". A bare language subtag is a valid tag on its own, so the shipped
+# files stay "fr" and "zh"; a region or script subtag is added only when a
+# dialect actually diverges, which is a question of evidence, not of naming.
+#
+# A tag is not a bash identifier. `BIAS_FR-CA_MODE=x` parses as a command, not
+# an assignment, so a conf named fr-CA.conf registered NOTHING and said nothing
+# about it: the hook still exited 0 and the language was simply absent. Silent
+# absence is the exact failure this feature exists to remove, so the suffix is
+# derived here, and _bias_registry_audit below refuses to let a broken conf
+# pass unnoticed.
+# In-shell, because this is called on the blocking path of every prompt.
+#
+# `printf | tr` is two processes, and the hook asked for a suffix 117 times per
+# run: 117 process starts out of the 139 the whole bias detector made, which
+# was most of the 0.45s it added to every prompt before the model saw it.
+# Bash 3.2 has no ${x^^}, so the table is spelled out. Only [a-z] is mapped;
+# anything else is passed through, which keeps a glob character in a tag from
+# being read as a pattern by the prefix trick below.
+# The result lands in _BIAS_SUFFIX, not on stdout: `$(...)` is a subshell too.
+_BIAS_LOWER="abcdefghijklmnopqrstuvwxyz"
+_BIAS_UPPER="ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+_bias_var_suffix() {
+    local input="$1" out="" char prefix
+    while [[ -n "$input" ]]; do
+        char="${input:0:1}"
+        input="${input:1}"
+        # Not `[a-z]`: a glob range is collation-dependent, and on this
+        # machine it matched `H` as well, whose prefix search then found
+        # nothing and dropped the character. `zh-Hant` came out `ZH_ANT`.
+        # The prefix having actually moved is the only reliable test.
+        if [[ "$char" == "-" ]]; then
+            out="${out}_"
+        else
+            prefix="${_BIAS_LOWER%%"$char"*}"
+            if [[ "$prefix" != "$_BIAS_LOWER" ]]; then
+                out="${out}${_BIAS_UPPER:${#prefix}:1}"
+            else
+                out="${out}${char}"
+            fi
+        fi
+    done
+    _BIAS_SUFFIX="$out"
+}
+
+# A registered tag whose MODE never landed means its conf declared variables
+# under a different suffix than its tag, or failed to parse. Report it on
+# stderr the way lang-registry.sh reports a missing python3, and drop the tag
+# so no caller reads a half-registered language as a working one.
+_bias_registry_audit() {
+    local lang mode_variable kept=()
+    _BIAS_REGISTERED_SUFFIXES=()
+    for lang in ${BIAS_REGISTERED_LANGS[@]+"${BIAS_REGISTERED_LANGS[@]}"}; do
+        _bias_var_suffix "$lang"
+        mode_variable="BIAS_${_BIAS_SUFFIX}_MODE"
+        if [[ -n "${!mode_variable:-}" ]]; then
+            kept+=("$lang")
+            _BIAS_REGISTERED_SUFFIXES+=("$_BIAS_SUFFIX")
+            continue
+        fi
+        echo "craftsman: bias pattern file for '$lang' declared no BIAS_${_BIAS_SUFFIX}_MODE, so that language is NOT loaded" >&2
+    done
+    BIAS_REGISTERED_LANGS=(${kept[@]+"${kept[@]}"})
+    return 0
+}
+
+# bias_registry_init <directory> - source every *.conf, deterministically ordered.
+# Re-init resets state: a second call with a different directory must not
+# serve the first directory's patterns.
+bias_registry_init() {
+    local directory="$1" pattern_file suffix
+    # Unset every variable a previous init registered, then the lists.
+    for suffix in ${_BIAS_REGISTERED_SUFFIXES[@]+"${_BIAS_REGISTERED_SUFFIXES[@]}"}; do
+        unset "BIAS_${suffix}_MODE" \
+              "BIAS_${suffix}_ACCELERATION" "BIAS_${suffix}_SCOPE_CREEP" \
+              "BIAS_${suffix}_OVER_OPT" "BIAS_${suffix}_DOMAIN_MODELING" \
+              "BIAS_${suffix}_TEST_DISMISSAL" 2>/dev/null || true
+    done
+    BIAS_REGISTERED_LANGS=()
+    _BIAS_REGISTERED_SUFFIXES=()
+
+    [[ -d "$directory" ]] || return 0
+    for pattern_file in "$directory"/*.conf; do
+        [[ -f "$pattern_file" ]] || continue
+        # shellcheck source=/dev/null
+        source "$pattern_file"
+    done
+    _bias_registry_audit
+    return 0
+}
+
+# bias_combined_pattern <CATEGORY> <mode>
+# Prints the |-joined alternation across every language of that mode.
+# Returns 1 with NO output when no language contributes: an empty pattern
+# handed to grep -E matches every prompt, so absence must be a distinct,
+# checkable state and never an empty string.
+bias_combined_pattern() {
+    local category="$1" mode="$2"
+    local suffix mode_variable pattern_variable pattern combined=""
+    for suffix in ${_BIAS_REGISTERED_SUFFIXES[@]+"${_BIAS_REGISTERED_SUFFIXES[@]}"}; do
+        mode_variable="BIAS_${suffix}_MODE"
+        [[ "${!mode_variable:-}" == "$mode" ]] || continue
+        pattern_variable="BIAS_${suffix}_${category}"
+        pattern="${!pattern_variable:-}"
+        [[ -z "$pattern" ]] && continue
+        if [[ -n "$combined" ]]; then
+            combined="${combined}|${pattern}"
+        else
+            combined="$pattern"
+        fi
+    done
+    [[ -z "$combined" ]] && return 1
+    printf '%s' "$combined"
+    return 0
+}

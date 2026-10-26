@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+# =============================================================================
+# What the hooks actually cost, measured, on every change.
+#
+# Four documents claimed "Level 1: regex validation, under 50ms". Measured on
+# the smallest input there is, a three-line PHP file, post-write-check.sh took
+# 0.73s and bias-detector.sh 0.45s: 15 to 60 times the published figure,
+# reproduced on two machines. A number nobody measures drifts, so the number in
+# the documentation now comes from this file.
+#
+# The ceiling is expressed as a MULTIPLE of a calibration baseline measured in
+# the same run, not as milliseconds. The hooks' cost is dominated by process
+# starts (roughly 190 of them for one post-write run), and a fork costs what
+# the machine costs: an absolute ceiling would pass on a workstation and flake
+# on a loaded CI runner, which is the fastest way to have the ceiling deleted.
+#
+# Usage:
+#   bash tests/perf/test-hook-latency.sh            # assert the ceilings
+#   bash tests/perf/test-hook-latency.sh --report   # print the table only
+# =============================================================================
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+source "$SCRIPT_DIR/../lib/test-helpers.sh"
+
+RUNS="${CRAFTSMAN_PERF_RUNS:-7}"
+REPORT_ONLY=false
+[[ "${1:-}" == "--report" ]] && REPORT_ONLY=true
+
+# The machine's own calibration memory lives OUTSIDE the sandbox this run
+# creates and deletes. Captured before the two overrides below, because both of
+# them point at the temporary directory: written there, the file was destroyed
+# on exit, every run was the first run, and the derivation that reads it was
+# dead code under a comment claiming it worked. The observable behaviour was
+# identical to having no derivation at all, which is why it took executing it
+# twice to see.
+# Deliberately NOT CLAUDE_PLUGIN_DATA. This is a fact about the MACHINE, and
+# every harness in this repository redirects that variable at a temporary
+# directory: pointed there, the memory was written into a sandbox deleted on
+# exit, so every run was the first run and the derivation below was dead code
+# under a comment claiming it worked.
+_PERF_STATE_DIR="${HOME}/.claude"
+mkdir -p "$_PERF_STATE_DIR" 2>/dev/null || true
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/craftsman-perf.XXXXXX")"
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+export CLAUDE_PLUGIN_ROOT="$ROOT_DIR"
+export CLAUDE_PLUGIN_DATA="$WORK/data"
+mkdir -p "$CLAUDE_PLUGIN_DATA"
+
+# HOME too, because `post-write-check.sh` reads ~/.claude/.craft-config.yml as
+# the global rules layer: without this the benchmark measured whatever the
+# developer happens to have there, and the number moved from machine to machine
+# for reasons that have nothing to do with the code.
+export HOME="$WORK/home"
+mkdir -p "$HOME/.claude"
+
+# The smallest realistic input: a file that violates nothing, in a repository
+# with one commit. Anything larger measures the validators; this measures what
+# every write pays before any finding exists.
+PROJECT="$WORK/project"
+mkdir -p "$PROJECT/src"
+cat > "$PROJECT/src/A.php" <<'PHP'
+<?php
+declare(strict_types=1);
+final class A {}
+PHP
+( cd "$PROJECT" && git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm one ) >/dev/null 2>&1
+
+# Median, not mean: one slow run (a cold page cache, another process waking up)
+# moves a mean and does not move a median.
+# The MINIMUM for the verdict, the median for the report, and the difference
+# between them is the whole difference between a benchmark and a coin toss.
+#
+# The first version asserted on the median and went red inside the full suite
+# while passing on its own: the suite runs it last, on a machine still busy
+# with everything before it, and a median absorbs that. Contention can only
+# ever make a run slower, never faster, so the fastest of N runs is the closest
+# thing to the uncontended cost that repeated sampling can give. The median is
+# printed beside it, because the gap between the two says the machine was busy.
+_min_ms() {
+    local command="$1" runs="$2"
+    python3 - "$command" "$runs" <<'PYTIME'
+import subprocess, sys, time
+command, runs = sys.argv[1], int(sys.argv[2])
+samples = []
+for _ in range(runs):
+    started = time.time()
+    subprocess.run(["bash", "-c", command], capture_output=True)
+    samples.append((time.time() - started) * 1000)
+samples.sort()
+print("%.1f %.1f" % (samples[0], samples[len(samples) // 2]))
+PYTIME
+}
+
+# The calibration wants one number, and it wants the uncontended one too.
+_median_ms() {
+    local pair
+    pair="$(_min_ms "$1" "$2")" || return 1
+    printf '%s' "${pair%% *}"
+}
+
+# The instrument before the experiment. `_median_ms` delegates to python3, and
+# without it every median came back EMPTY: bash evaluates "" as 0 in an
+# arithmetic test, so `[[ "" -le 220 ]]` is true and all three ceilings passed
+# while nothing had been measured. A benchmark that reports success without
+# measuring is the exact defect this file exists to end.
+if ! command -v python3 >/dev/null 2>&1; then
+    log_fail "the benchmark can run" "python3 not found, so nothing can be measured"
+    test_summary
+fi
+
+_is_measurement() {
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+}
+
+# The calibration has the SHAPE of a hook, not merely its ingredients.
+#
+# A basket of `bash -c true`, one python3 start and one read was better than
+# `true` alone and still wrong under load, measured: with twelve busy loops on
+# ten cores the basket grew 1.3x while the hooks grew 1.95x, because a
+# post-write run makes about 106 process starts and the basket makes three.
+# The ratio then grew 1.5x on unchanged code, against a 1.4x margin, so the
+# suite went red for a reason that had nothing to do with the change under
+# test: exactly the flake this file's own comment says would get the ceiling
+# deleted.
+#
+# So the baseline is fifty real forks plus one python3 start and one read. It
+# grows the way the hooks grow because it is made of the same thing they are
+# made of, which makes the ratio invariant to load by construction rather than
+# by hope.
+# Fifty forks and THREE interpreter starts, not one. Measured on two hosted
+# macOS runner instances whose fork cost differed 2.2x (basket 98ms against
+# 165ms) while an interpreter start cost about the same on both: solving the
+# two runs for the hooks' composition put bias-detector.sh at about 44 forks
+# plus 3 python3 starts and post-write-check.sh at about 168 plus 8. With one
+# start in the basket the same commit read bias at 1.37x on one instance and
+# 2.46x on the other, and no ceiling can be both above 2.46 and below twice
+# 1.37, which is what the doubling check demands. With three, the projected
+# spread is 0.92x to 0.94x: the basket has the hooks' mix, so what moves the
+# hooks moves it too.
+CALIBRATION_FORKS=50
+CALIBRATION_PYTHON_STARTS=3
+CALIBRATION_WORKLOAD="for _ in \$(seq 1 $CALIBRATION_FORKS); do /bin/echo x >/dev/null; done; for _ in \$(seq 1 $CALIBRATION_PYTHON_STARTS); do python3 -c pass; done; cat '$PROJECT/src/A.php' >/dev/null"
+
+FLOOR_MS="$(_median_ms "$CALIBRATION_WORKLOAD" 7)"
+if ! _is_measurement "$FLOOR_MS"; then
+    log_fail "the calibration produced a number" "got '$FLOOR_MS'"
+    test_summary
+fi
+[[ "$FLOOR_MS" == "0.0" ]] && FLOOR_MS="1.0"
+
+echo "=== Hook latency ==="
+echo "calibration: ${FLOOR_MS}ms (${CALIBRATION_FORKS} forks + ${CALIBRATION_PYTHON_STARTS} python3 starts + one read, fastest of 7)"
+echo ""
+printf '%-26s %11s %12s %10s %9s\n' "hook" "fastest" "median" "x baseline" "ceiling"
+
+# What these ceilings can and cannot catch, stated rather than implied: at 1.4
+# times the measured value they catch a doubling and a 50% regression (the
+# latter by 2% of margin on a bad run), and they will not see a 30% one. Buying
+# that sensitivity means a tighter margin than load invariance can carry.
+#
+# bias-detector.sh is the exception, at 1.8x. Its cost is the baseline's cost,
+# so its ratio is about 1.00 and there is nothing left to normalise: a hook
+# that costs what fifty forks cost is not measurable in multiples of fifty
+# forks. Observed 1.00 to 1.30x across a 1.92x change in machine speed, so the
+# real margin at 1.5x was 1.15x, tight enough to flake. It is guarded mostly by
+# the wall-clock backstop, and that is a property of the hook being cheap, not
+# a gap in the instrument.
+#
+# Roughly 1.4 times what the hooks measure today against the basket baseline,
+# which leaves room for a slower machine and none for a regression that doubles
+# the work. They are meant to be lowered when the number drops, never raised
+# when it rises, and the sleeping-hook check below proves the tightest one can
+# still fail.
+
+RESULTS=""
+
+# A ratio AND a wall-clock backstop. The ratio survives a slow machine; the
+# backstop is what stops a ratio from absolving two seconds of real latency
+# because the baseline was slow too.
+# A wall-clock backstop, so no ratio can absolve real latency by pointing at a
+# slow baseline. Above the slowest measurement here (a write with three
+# violations, ~1.7s on a quiet machine), far below the point where a user would
+# call the plugin broken, and lowered when the dirty path gets cheaper.
+CEILING_MS_BACKSTOP=2500
+
+# It is applied only on a quiet machine, and that is a statement about what a
+# wall clock can and cannot attribute. The threshold is well ABOVE this
+# machine's idle calibration, not inside its noise: at 12ms against an idle
+# spread of 11.7 to 12.9ms, the only ceiling a ratio cannot absolve was armed
+# or disarmed by a coin toss, two runs out of six on an idle laptop. Under sustained load every number here
+# grows, including the fastest of N runs, and the growth belongs to the machine
+# rather than to the code: enforcing an absolute figure there would fail this
+# suite for the crime of running after the rest of it, which is how a benchmark
+# gets deleted. The ratio still applies in both cases; only the absolute one is
+# suspended, and the suspension is printed.
+# Derived from this machine's own fastest calibration ever recorded, not from a
+# number typed into a file whose thesis is that typed numbers do not travel.
+# 300ms is right for this laptop and wrong for a slow CI container, where an
+# idle calibration above it would suspend the backstop permanently while the
+# output said "busy": a slow machine and a loaded one would be indistinguishable
+# forever.
+# Named after the basket's shape. A memory taken with the one-start basket
+# (126ms on this laptop) read against the three-start one (200ms) says "busy"
+# on an idle machine forever, and the backstop it arms would never apply
+# again. A new shape starts a new memory.
+CALIBRATION_FLOOR_FILE="${_PERF_STATE_DIR}/craftsman-perf-calibration-${CALIBRATION_FORKS}f${CALIBRATION_PYTHON_STARTS}p"
+CALIBRATION_QUIET_MS=300
+if [[ -f "$CALIBRATION_FLOOR_FILE" ]]; then
+    _seen_floor="$(head -1 "$CALIBRATION_FLOOR_FILE" 2>/dev/null)"
+    if _is_measurement "${_seen_floor:-}"; then
+        CALIBRATION_QUIET_MS="$(python3 -c "print('%.1f' % (1.5 * $_seen_floor))")"
+    fi
+fi
+# Record the fastest calibration this machine has ever produced, which is the
+# closest thing it has to "idle".
+if [[ ! -f "$CALIBRATION_FLOOR_FILE" ]] \
+    || [[ "$(python3 -c "print(1 if $FLOOR_MS < $(head -1 "$CALIBRATION_FLOOR_FILE" 2>/dev/null || echo 999999) else 0)" 2>/dev/null || echo 0)" -eq 1 ]]; then
+    printf '%s\n' "$FLOOR_MS" > "$CALIBRATION_FLOOR_FILE" 2>/dev/null || true
+fi
+MACHINE_IS_QUIET=$(python3 -c "print(1 if $FLOOR_MS <= $CALIBRATION_QUIET_MS else 0)" 2>/dev/null || echo 0)
+
+# Did the memory actually survive the run that wrote it? A derivation that
+# silently keeps falling back to the constant is indistinguishable from no
+# derivation at all on a machine where the constant happens to fit, which is
+# exactly how it shipped the first time.
+CALIBRATION_MEMORY="absent"
+if [[ -f "$CALIBRATION_FLOOR_FILE" ]]; then
+    _stored="$(head -1 "$CALIBRATION_FLOOR_FILE" 2>/dev/null)"
+    _is_measurement "${_stored:-}" && CALIBRATION_MEMORY="$_stored"
+fi
+
+measure_hook() {
+    local label="$1" ceiling_factor="$2" command="$3"
+    local pair fastest median ratio
+    pair="$(_min_ms "$command" "$RUNS")"
+    fastest="${pair%% *}"
+    median="${pair##* }"
+    if ! _is_measurement "$fastest" || ! _is_measurement "$median"; then
+        # Reported as a failure and NOT carried into the verdict loop. Feeding
+        # a zero through it printed `stays under 1.5x the baseline (0ms, 0x)`
+        # in green beside the failure, because `0 <= 1.5` is true: a line
+        # asserting a hook respects its ceiling when nothing was measured is
+        # the same defect this whole file exists to remove, committed by the
+        # file itself.
+        log_fail "$label was measured" "the timing came back '$pair', so nothing was measured"
+        printf '%-26s %9s %10s %9s %8sx\n' "$label" "not" "measured" "-" "$ceiling_factor"
+        return 0
+    fi
+    ratio="$(python3 -c "print('%.2f' % ($fastest / $FLOOR_MS))")"
+    # Both, because the gap between the fastest run and the median is the
+    # signal that the machine was busy while measuring.
+    printf '%-26s %9sms %10sms %9sx %8sx\n' "$label" "$fastest" "$median" "$ratio" "$ceiling_factor"
+    RESULTS="${RESULTS}${label}|${fastest}|${ratio}|${ceiling_factor}"$'\n'
+}
+
+POST_PAYLOAD="$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"cwd":"%s"}' \
+    "$PROJECT/src/A.php" "$PROJECT")"
+PRE_PAYLOAD="$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s","content":"<?php\\ndeclare(strict_types=1);\\nfinal class B {}\\n"},"cwd":"%s"}' \
+    "$PROJECT/src/B.php" "$PROJECT")"
+PROMPT_PAYLOAD='{"prompt":"add a value object for the invoice total"}'
+
+cat > "$PROJECT/src/Dirty.php" <<'PHPDIRTY'
+<?php
+class Dirty {
+    public function setName($name) { $this->name = $name; }
+    public function query($id) { return "SELECT * FROM t WHERE id = " . $id; }
+}
+PHPDIRTY
+DIRTY_PAYLOAD="$(printf '{"tool_name":"Write","tool_input":{"file_path":"%s"},"cwd":"%s"}' \
+    "$PROJECT/src/Dirty.php" "$PROJECT")"
+
+# The ceilings are per operating system. The basket absorbs load, and it
+# absorbs a cheaper fork less well: fifty echoes plus three python3 starts,
+# while post-write starts python3 five times, pre-write twice and the bias
+# detector twice. The rest of a hook is the shell script. A runner whose
+# forks are cheap shrinks the basket more than the hooks, so every ratio
+# steps up together while every absolute time falls.
+#
+# Same tree 7e9b4e7 on two ubuntu-latest runners (35639724845, then
+# 35657109085). Calibration 84.1ms, then 56.0ms. Ratios 8.42, 7.89, 2.40,
+# 12.10, then 9.59, 9.52, 2.69, 14.33. Absolute times fell on every row
+# (708 to 537, 663 to 533, 202 to 151, 1018 to 803). The 9.5/9.0/2.65/14
+# table sat inside that spread: the quiet runner passed, the fast-fork
+# runner failed the same commit. Linux is 1.35x the quiet reading and at
+# least 1.15x the fast one, so the fast run passes and a 50 percent
+# regression of the quiet reading still fails. Each row stays under twice
+# the quiet reading, which is what the doubling check below requires.
+#
+# Darwin follows the same rule since CR-179 (2026-09-27). Thirty macos-latest
+# runs of ci.yml, 3208c05 to 1ba57ae: absolute times follow the calibration
+# (correlation 0.81 for post-write) while the ratios run against it (-0.33
+# post-write, -0.49 bias): the same basket effect as on Linux. The same code
+# (1ba57ae, then 449314d which only moved the ratchet baseline) read 5.36x,
+# 4.07x and 5.57x for post-write, and the 5.57x failed a 5.5x ceiling with no
+# hook slower. Quiet reading (median over the runs whose calibration is at or
+# above the median): post-write 4.85x, pre-write 3.39x, bias 1.37x; worst
+# seen 5.57x, 4.24x, 1.79x. Ceiling = max(1.35 x quiet, 1.15 x worst), kept
+# under 1.5 x quiet so a 50 percent regression of the quiet reading still
+# fails: post-write 6.5x, bias 2.05x; pre-write's 5.0x already fits.
+# QUIET_READINGS records the reading each row was set from, and the check
+# below refuses a ceiling raised past 1.5 times it.
+#
+# pre-write was raised on purpose (2.5x to 3.5x on Darwin, 7.3x to 9.0x on
+# Linux) when the gate stopped running its own regexes and started judging
+# the would-be file through the pack validators on a mirror, the same
+# dispatch post-write runs: this laptop went from 1.91x to 2.64x. The 150ms
+# buy one set of detectors instead of a fork that let an Acme\ project through.
+# The 3.5x that came with it was set from the laptop alone and sat inside the
+# macOS runner's noise: four readings of the same code on macos-latest gave
+# 3.09x, 3.73x, 3.55x and 2.79x (ubuntu: 7.11x, 6.90x against 9.0x). 5.0x is
+# 1.35x over the worst of them and under twice the fastest (2 x 2.64x).
+#
+# Lowered on 2026-10-24, after the CR-278 passes halved the hooks: the old
+# rows sat at twice what the hooks now read, so a doubling passed. Four runs
+# of ci.yml after the last hook pass (40099848955, 40101280055, 40102681461,
+# 40102799045), same rule as above. Darwin quiet reading 2.55x, 2.73x, 0.70x, dirty 7.5x; worst
+# 2.95x, 3.39x, 0.81x, 10.36x, and this laptop under load read up to 3.05x
+# post-write, so the post-write row takes 1.15 x 3.05. Linux quiet reading
+# 3.65x, 3.43x, 0.88x, dirty 7.6x; worst 3.90x, 3.69x, 0.95x, 8.05x.
+_PERF_ENV="$(uname -s)"
+case "$_PERF_ENV" in
+    Linux)  C_POST=4.9;  C_PRE=4.65; C_BIAS=1.2; C_DIRTY=10.3; QUIET_READINGS="3.65 3.43 0.88" ;;
+    *)      C_POST=3.55; C_PRE=3.9;  C_BIAS=1.0; C_DIRTY=11.9; QUIET_READINGS="2.55 2.73 0.70" ;;
+esac
+echo "ceilings for ${_PERF_ENV}: post-write ${C_POST}x, pre-write ${C_PRE}x, bias ${C_BIAS}x, dirty ${C_DIRTY}x"
+# A ceiling raised to absorb noise must still catch a 50 percent regression of
+# the reading it was set from: over 1.5 times that reading, it masks one.
+LOOSE_CEILINGS=$(python3 -c '
+import sys
+ceilings = [float(v) for v in sys.argv[1:4]]
+quiet = [float(v) for v in sys.argv[4].split()]
+names = ("post-write", "pre-write", "bias")
+print(" ".join("%s %.2fx > 1.5 x %.2fx" % (n, c, q) for n, c, q in zip(names, ceilings, quiet) if c > 1.5 * q))
+' "$C_POST" "$C_PRE" "$C_BIAS" "$QUIET_READINGS")
+if [[ -z "$LOOSE_CEILINGS" ]]; then
+    log_pass "every ceiling still catches a 50 percent regression of the quiet reading it was set from"
+else
+    log_fail "a ceiling masks a 50 percent regression" "$LOOSE_CEILINGS"
+fi
+
+measure_hook "post-write-check.sh" "$C_POST" \
+    "cd '$PROJECT' && printf '%s' '$POST_PAYLOAD' | bash '$ROOT_DIR/hooks/post-write-check.sh' >/dev/null 2>&1"
+measure_hook "pre-write-check.sh" "$C_PRE" \
+    "cd '$PROJECT' && printf '%s' '$PRE_PAYLOAD' | bash '$ROOT_DIR/hooks/pre-write-check.sh' >/dev/null 2>&1"
+measure_hook "bias-detector.sh" "$C_BIAS" \
+    "cd '$PROJECT' && printf '%s' '$PROMPT_PAYLOAD' | bash '$ROOT_DIR/hooks/bias-detector.sh' >/dev/null 2>&1"
+
+# A file that violates nothing measures the floor, and the floor is not what a
+# user pays. Every recorded violation starts its own python3 for the metrics
+# insert, so the cost of a real write scales with the findings in it: this is
+# the path where the remaining latency lives, and no ceiling covered it.
+measure_hook "post-write, 3 violations" "$C_DIRTY" \
+    "cd '$PROJECT' && printf '%s' '$DIRTY_PAYLOAD' | bash '$ROOT_DIR/hooks/post-write-check.sh' >/dev/null 2>&1"
+
+echo ""
+if [[ "$CALIBRATION_MEMORY" == "absent" ]]; then
+    echo "calibration memory: none yet, threshold is the ${CALIBRATION_QUIET_MS}ms fallback"
+else
+    echo "calibration memory: ${CALIBRATION_MEMORY}ms fastest ever seen here, quiet threshold ${CALIBRATION_QUIET_MS}ms"
+fi
+if [[ "$MACHINE_IS_QUIET" -eq 1 ]]; then
+    echo "wall-clock backstop: ${CEILING_MS_BACKSTOP}ms, applied"
+else
+    echo "wall-clock backstop: suspended, the ${FLOOR_MS}ms calibration says this machine is busy (quiet is <= ${CALIBRATION_QUIET_MS}ms)"
+fi
+echo ""
+
+if [[ "$REPORT_ONLY" == true ]]; then
+    exit 0
+fi
+
+while IFS='|' read -r label median ratio ceiling; do
+    [[ -z "$label" ]] && continue
+    over_backstop=0
+    if [[ "$MACHINE_IS_QUIET" -eq 1 ]]; then
+        over_backstop=$(python3 -c "print(1 if $median > $CEILING_MS_BACKSTOP else 0)" 2>/dev/null || echo 1)
+    fi
+    # Decimal, so bash cannot compare it. The ratios are single digits now that
+    # the baseline has the hooks' shape, and rounding them to whole numbers
+    # threw away most of the resolution the ceiling needs.
+    under_ceiling=$(python3 -c "print(1 if $ratio <= $ceiling else 0)" 2>/dev/null || echo 0)
+    if [[ "$under_ceiling" -eq 1 && "$over_backstop" -eq 0 ]]; then
+        log_pass "$label stays under ${ceiling}x the baseline (${median}ms, ${ratio}x)"
+    elif [[ "$over_backstop" -eq 1 ]]; then
+        log_fail "$label crossed the wall-clock backstop" \
+            "${median}ms, backstop is ${CEILING_MS_BACKSTOP}ms, whatever the ratio says"
+    else
+        log_fail "$label crossed its ceiling" \
+            "${median}ms is ${ratio}x the ${FLOOR_MS}ms baseline, ceiling is ${ceiling}x"
+    fi
+done <<< "$RESULTS"
+
+# The instrument, seen red on purpose, in the same run that trusts it. A
+# ceiling nobody has watched fail is a ceiling nobody knows is wired up.
+#
+# What is exercised is the comparison itself, at the ceiling: a run just OVER
+# the tightest ceiling must be refused, and one well under it must pass. The
+# previous form doubled the tightest hook and asked whether the doubling
+# crossed the ceiling. That holds only while the hook already costs more than
+# half its ceiling, and on a macOS runner where bias-detector measured 0.83x
+# of a 1.8x ceiling the doubled run landed at 1.70x and the check failed
+# while every hook was comfortably inside its budget (2026-09-20). The
+# premise was arithmetic, not a regression: an instrument that reports a
+# fault on a healthy tree teaches its readers to skip it.
+# LC_ALL=C, because awk reads `1.8` through the locale's decimal separator:
+# under fr_FR it parses as 1, and the smallest ceiling came out as 1x on a
+# French machine while CI, running under C, saw 1.8x. A number that changes
+# with the operator's locale is not a measurement.
+SMALLEST_CEILING="$(printf '%s' "$RESULTS" | LC_ALL=C awk -F'|' '
+    NF >= 4 && $4 + 0 > 0 { if (smallest == "" || $4 + 0 < smallest) smallest = $4 + 0 }
+    END { printf "%s", (smallest == "" ? 0 : smallest) }')"
+
+if _is_measurement "$FLOOR_MS" && [[ "$FLOOR_MS" != "0" ]] && [[ "$SMALLEST_CEILING" != "0" ]]; then
+    OVER_SECONDS="$(python3 -c "print('%.3f' % (1.15 * $SMALLEST_CEILING * $FLOOR_MS / 1000.0))")"
+    UNDER_SECONDS="$(python3 -c "print('%.3f' % (0.50 * $SMALLEST_CEILING * $FLOOR_MS / 1000.0))")"
+    OVER_MS="$(_median_ms "sleep $OVER_SECONDS" 3)"
+    UNDER_MS="$(_median_ms "sleep $UNDER_SECONDS" 3)"
+    OVER_RATIO="$(python3 -c "print('%.2f' % ($OVER_MS / $FLOOR_MS))" 2>/dev/null || echo 0)"
+    UNDER_RATIO="$(python3 -c "print('%.2f' % ($UNDER_MS / $FLOOR_MS))" 2>/dev/null || echo 0)"
+    both=$(python3 -c "print(1 if $OVER_RATIO > $SMALLEST_CEILING and $UNDER_RATIO <= $SMALLEST_CEILING else 0)" 2>/dev/null || echo 0)
+    if [[ "$both" -eq 1 ]]; then
+        log_pass "the tightest ceiling (${SMALLEST_CEILING}x) refuses a run above it (${OVER_RATIO}x) and accepts one below (${UNDER_RATIO}x)"
+    else
+        log_fail "the tightest ceiling is wired in both directions" \
+            "over=${OVER_MS}ms ${OVER_RATIO}x, under=${UNDER_MS}ms ${UNDER_RATIO}x, ceiling ${SMALLEST_CEILING}x"
+    fi
+else
+    log_fail "the instrument could be checked against itself" \
+        "no measurement to derive a synthetic regression from"
+fi
+
+# The memory is asserted, not assumed. Written into the sandbox, it vanished
+# with the sandbox and nothing said so.
+if [[ "$CALIBRATION_MEMORY" != "absent" ]]; then
+    log_pass "the calibration memory survives a run (${CALIBRATION_MEMORY}ms)"
+else
+    log_fail "the calibration memory survives a run" \
+        "nothing at $CALIBRATION_FLOOR_FILE, so the quiet threshold can only ever be the typed constant"
+fi
+
+# The published figure has to be the measured one, or it drifts again. These
+# four documents quote the benchmark; the assertion is that they quote it at
+# all, not that a number in prose equals a number measured here, which would
+# fail on every machine.
+for doc in "CLAUDE.md" "README.md" "README.fr.md" "docs/guides/semantic-level-1-5.md"; do
+    if grep -q "tests/perf/test-hook-latency.sh" "$ROOT_DIR/$doc" 2>/dev/null; then
+        log_pass "$doc points at the benchmark for its latency figure"
+    else
+        log_fail "$doc points at the benchmark for its latency figure" \
+            "still quoting a number with no measurement behind it"
+    fi
+done
+
+test_summary

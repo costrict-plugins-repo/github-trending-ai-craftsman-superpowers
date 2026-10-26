@@ -1,0 +1,1979 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Hook Behavior Tests
+# Tests post-write-check.sh and pre-write-check.sh with fixtures.
+# =============================================================================
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+FIXTURES_DIR="$SCRIPT_DIR/fixtures"
+
+# Shared test framework
+source "$SCRIPT_DIR/../lib/test-helpers.sh"
+
+# Use temp dir for metrics to avoid polluting real DB
+export CLAUDE_PLUGIN_DATA="/tmp/craftsman-hook-tests-$$"
+export CLAUDE_PLUGIN_ROOT="$ROOT_DIR"
+
+# These fixtures assert what a RULE does, so they pin the strictness instead of
+# inheriting it. The default is no longer a constant: a repository with history
+# now seeds `moderate`, and this suite runs inside one, so an unpinned run
+# asserted the default rather than the rule. The default itself is asserted on
+# purpose further down, in both of its shapes.
+export CLAUDE_PLUGIN_OPTION_strictness="strict"
+
+# Run a hook with fixture, capture exit code and output
+run_post_hook() {
+    local fixture="$1"
+    local output
+    output=$(echo "{\"tool_input\":{\"file_path\":\"$fixture\"}}" | bash "$ROOT_DIR/hooks/post-write-check.sh" 2>/dev/null)
+    local exit_code=$?
+    echo "$exit_code|$output"
+}
+
+run_pre_hook() {
+    local file_path="$1"
+    local content="$2"
+    local output
+    # printf '%b', because these fixtures write `\n` and every validator regex
+    # is anchored per line. Passed through verbatim, the whole fixture reached
+    # the hook as ONE line: `use App\Infrastructure` never sat at a line start,
+    # LAYER001 never fired, and the assertion named after it passed on a
+    # different rule blocking for a different reason. It only showed red the day
+    # that other rule stopped blocking.
+    content="$(printf '%b' "$content")"
+    output=$(jq -n --arg fp "$file_path" --arg c "$content" '{"tool_input":{"file_path":$fp,"content":$c}}' | bash "$ROOT_DIR/hooks/pre-write-check.sh" 2>/dev/null)
+    local exit_code=$?
+    echo "$exit_code|$output"
+}
+
+# =============================================================================
+# Pre-Write Hook Tests - the only place exit 2 actually stops a write
+# =============================================================================
+# PreToolUse is the one Write/Edit event where the hooks reference grants
+# blocking ("Blocks the tool call"). On PostToolUse exit 2 only shows stderr to
+# Claude, because "the tool already ran" - so the post-write assertions below
+# prove detection, not prevention, and are worded accordingly.
+echo ""
+echo "=== Pre-Write Hook Tests (real blocking) ==="
+
+result=$(run_pre_hook "/tmp/craftsman-prewrite-$$/src/Domain/Order.php" \
+    '<?php
+namespace App\Domain;
+use App\Infrastructure\Doctrine\OrderRepository;
+class Order {}')
+if [[ "${result%%|*}" == "2" ]]; then
+    log_pass "PreToolUse refuses the write on a layer violation (exit 2 blocks here)"
+else
+    log_fail "pre-write blocking" "expected exit 2, got ${result%%|*}"
+fi
+
+# Counter-test: the gate must not refuse clean content, or the assertion above
+# would also pass with the validator crashed or matching everything.
+result=$(run_pre_hook "/tmp/craftsman-prewrite-$$/src/Domain/Money.php" \
+    '<?php
+declare(strict_types=1);
+namespace App\Domain;
+final class Money {}')
+if [[ "${result%%|*}" == "0" ]]; then
+    log_pass "PreToolUse lets clean content through (exit 0)"
+else
+    log_fail "pre-write false positive" "expected exit 0, got ${result%%|*}"
+fi
+
+# An Edit is a write too. The gate read `.tool_input.content` only, which an
+# Edit does not carry, so the same LAYER001 that Write refused went through
+# untouched as an old_string/new_string pair (guardrail review, E2 against E1).
+# README.md promises "refused before the write lands"; that has to hold for
+# both tools that land a write.
+EDIT_DIR="/tmp/craftsman-prewrite-$$/src/Domain"
+mkdir -p "$EDIT_DIR"
+printf '<?php\ndeclare(strict_types=1);\nnamespace App\\Domain;\nfinal class Order {}\n' > "$EDIT_DIR/Edited.php"
+run_pre_edit() {
+    local file_path="$1" old="$2" new="$3" all="${4:-false}"
+    local output
+    output=$(jq -n --arg fp "$file_path" --arg o "$old" --arg n "$new" --argjson a "$all" \
+        '{"tool_name":"Edit","tool_input":{"file_path":$fp,"old_string":$o,"new_string":$n,"replace_all":$a}}' \
+        | bash "$ROOT_DIR/hooks/pre-write-check.sh" 2>/dev/null)
+    echo "$?|$output"
+}
+result=$(run_pre_edit "$EDIT_DIR/Edited.php" "final class Order {}" "use App\\Infrastructure\\Doctrine\\OrderRepository;
+final class Order {}")
+if [[ "${result%%|*}" == "2" ]]; then
+    log_pass "PreToolUse refuses an Edit that introduces a layer violation (the would-be file is judged)"
+else
+    log_fail "pre-write Edit blocking" "expected exit 2, got ${result%%|*}"
+fi
+result=$(run_pre_edit "$EDIT_DIR/Edited.php" "final class Order {}" "final class Order { public int \$total = 0; }")
+if [[ "${result%%|*}" == "0" ]]; then
+    log_pass "PreToolUse lets a clean Edit through (exit 0)"
+else
+    log_fail "pre-write Edit false positive" "expected exit 0, got ${result%%|*}"
+fi
+# An Edit whose old_string is not in the file: Claude Code refuses it itself,
+# and what the gate can still judge is what the edit adds.
+result=$(run_pre_edit "$EDIT_DIR/Edited.php" "not in this file" "use App\\Infrastructure\\Bus;")
+if [[ "${result%%|*}" == "2" ]]; then
+    log_pass "an Edit whose anchor is absent is judged on what it adds, never waved"
+else
+    log_fail "pre-write Edit with absent anchor" "expected exit 2, got ${result%%|*}"
+fi
+
+# The pre-write detectors were a fork of the pack validators: "App" hardcoded
+# where packs/symfony reads composer.json's psr-4 root, path-only where the
+# pack is path-or-namespace (architecture review, BLOCKING 2). Measured: an
+# Acme\ project passed pre-write and was refused post-write on the same
+# file. The gate now judges the would-be file through the packs themselves,
+# on a mirror of the workspace, so there is one set of detectors.
+ACME="/tmp/craftsman-prewrite-$$/acme"
+mkdir -p "$ACME/src/Domain"
+( cd "$ACME" && git init -q ) >/dev/null 2>&1
+printf '{"autoload":{"psr-4":{"Acme\\\\":"src/"}}}' > "$ACME/composer.json"
+result=$(run_pre_hook "$ACME/src/Domain/Order.php" \
+    '<?php
+declare(strict_types=1);
+namespace Acme\Domain;
+use Acme\Infrastructure\Doctrine\OrderRepository;
+final class Order {}')
+if [[ "${result%%|*}" == "2" ]] && echo "${result#*|}" | grep -q "LAYER001"; then
+    log_pass "PreToolUse refuses LAYER001 under a psr-4 root that is not App (the packs judge, not a fork)"
+else
+    log_fail "pre-write on a non-App psr-4 root" "expected exit 2 with LAYER001, got ${result%%|*}"
+fi
+# and a directory .craft-rules.yml demoting a rule is honoured on the mirror
+printf 'rules:\n  PHP001: warn\n' > "$ACME/src/Domain/.craft-rules.yml"
+result=$(run_pre_hook "$ACME/src/Domain/Money.php" \
+    '<?php
+namespace Acme\Domain;
+final class Money {}')
+if [[ "${result%%|*}" == "0" ]] && echo "${result#*|}" | grep -q "PHP001"; then
+    log_pass "a directory .craft-rules.yml is read on the mirror: PHP001 demoted to warn passes pre-write"
+else
+    log_fail "directory rules on the mirror" "expected exit 0 with a PHP001 warning, got ${result%%|*}: $(echo "${result#*|}" | tr '\n' ' ' | cut -c1-100)"
+fi
+rm -f "$ACME/src/Domain/.craft-rules.yml"
+
+# The gate that cannot run is not a clean verdict (ADR-0029, which the Hermes
+# adapter honoured and this hook did not): a crash inside the gate used to
+# exit 0 through the ERR trap and let the write land. Without `jq` nothing in
+# the hook can read its input; that is a crash, and the write is refused with
+# the reason and the retry advice. Malformed stdin is a different case, kept
+# by tests/core/test-security-invariants.sh: no file named, nothing to judge.
+NOJQ_BIN=$(mktemp -d "${TMPDIR:-/tmp}/craftsman-nojq.XXXXXX")
+for tool in bash python3 grep sed awk cat mktemp dirname basename cut tr head tail sort uniq wc printf env cksum shasum readlink find date mkdir rm mv cp touch ls git; do
+    p=$(command -v "$tool" 2>/dev/null) && ln -sf "$p" "$NOJQ_BIN/$tool"
+done
+CRASH_OUT=$(printf '{"tool_input":{"file_path":"%s/Crash.php","content":"<?php\n"}}' "$EDIT_DIR" \
+    | PATH="$NOJQ_BIN" bash "$ROOT_DIR/hooks/pre-write-check.sh" 2>&1); CRASH_RC=$?
+if [[ "$CRASH_RC" == "2" ]] && echo "$CRASH_OUT" | grep -q "could not run"; then
+    log_pass "a gate that cannot run refuses the write and says so (no verdict is not a clean verdict)"
+else
+    log_fail "a gate that cannot run refuses the write" "rc=$CRASH_RC out=$(echo "$CRASH_OUT" | head -2 | tr '\n' ' ')"
+fi
+CRASH_OUT=$(printf '{"tool_input":{"file_path":"%s/phpstan.neon"}}' "$EDIT_DIR" \
+    | PATH="$NOJQ_BIN" bash "$ROOT_DIR/hooks/config-protection.sh" 2>&1); CRASH_RC=$?
+if [[ "$CRASH_RC" == "2" ]] && echo "$CRASH_OUT" | grep -q "could not run"; then
+    log_pass "config-protection that cannot run refuses the write too"
+else
+    log_fail "config-protection that cannot run refuses the write" "rc=$CRASH_RC out=$(echo "$CRASH_OUT" | head -2 | tr '\n' ' ')"
+fi
+rm -rf "$NOJQ_BIN"
+
+# =============================================================================
+# Post-Write Hook Tests - detection only, exit 2 does not prevent the write
+# =============================================================================
+echo ""
+echo "=== Post-Write Hook Tests ==="
+
+# Test: Valid PHP should pass
+result=$(run_post_hook "$FIXTURES_DIR/valid-entity.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "Valid PHP passes (exit 0)"
+else
+    log_fail "Valid PHP should pass" "got exit $exit_code"
+fi
+
+# Test: Missing strict_types should block
+result=$(run_post_hook "$FIXTURES_DIR/invalid-no-strict.php")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "2" ]] && echo "$output" | grep -q "PHP001"; then
+    log_pass "Missing strict_types is reported to Claude (exit 2, PHP001)"
+else
+    log_fail "Missing strict_types should block" "exit=$exit_code"
+fi
+
+# Test: Missing final should block
+result=$(run_post_hook "$FIXTURES_DIR/invalid-no-final.php")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "2" ]] && echo "$output" | grep -q "PHP002"; then
+    log_pass "Missing final is reported to Claude (exit 2, PHP002)"
+else
+    log_fail "Missing final should block" "exit=$exit_code"
+fi
+
+# Test: TypeScript any should block
+result=$(run_post_hook "$FIXTURES_DIR/invalid-any.ts")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "2" ]] && echo "$output" | grep -q "TS001"; then
+    log_pass "TypeScript any is reported to Claude (exit 2, TS001)"
+else
+    log_fail "TypeScript any should block" "exit=$exit_code"
+fi
+
+# Test: Valid TypeScript should pass
+result=$(run_post_hook "$FIXTURES_DIR/valid-component.tsx")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "Valid TypeScript passes (exit 0)"
+else
+    log_fail "Valid TypeScript should pass" "got exit $exit_code"
+fi
+
+# Test: craftsman-ignore should pass (not block)
+result=$(run_post_hook "$FIXTURES_DIR/with-craftsman-ignore.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "craftsman-ignore suppresses blocking (exit 0)"
+else
+    log_fail "craftsman-ignore should suppress" "got exit $exit_code"
+fi
+
+# Test: each validated Write/Edit appends one line to the session-writes
+# exposure counter (denominator for violations-per-write benchmarks)
+rm -f "$CLAUDE_PLUGIN_DATA/session-writes"
+run_post_hook "$FIXTURES_DIR/valid-component.tsx" > /dev/null 2>&1
+run_post_hook "$FIXTURES_DIR/with-craftsman-ignore.php" > /dev/null 2>&1
+WRITES_LINES=$(wc -l < "$CLAUDE_PLUGIN_DATA/session-writes" 2>/dev/null | tr -d ' ')
+if [[ "${WRITES_LINES:-0}" == "2" ]]; then
+    log_pass "post-write-check increments session-writes counter (2 writes = 2 lines)"
+else
+    log_fail "session-writes counter" "expected 2 lines, got '${WRITES_LINES}'"
+fi
+
+# Test: Layer violation should block
+result=$(run_post_hook "$FIXTURES_DIR/invalid-layer-violation.php")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "2" ]] && echo "$output" | grep -q "LAYER"; then
+    log_pass "Layer violation is reported to Claude (exit 2, LAYER)"
+else
+    log_fail "Layer violation should block" "exit=$exit_code"
+fi
+
+# Test: JSON output is valid
+result=$(run_post_hook "$FIXTURES_DIR/invalid-no-strict.php")
+output="${result#*|}"
+if echo "$output" | jq . >/dev/null 2>&1; then
+    log_pass "Output is valid JSON"
+else
+    log_fail "Output should be valid JSON" "$output"
+fi
+
+# Test: Metrics were recorded
+METRIC_COUNT=$(sqlite3 "$CLAUDE_PLUGIN_DATA/metrics.db" "SELECT COUNT(*) FROM violations;" 2>/dev/null || echo 0)
+if [[ "$METRIC_COUNT" -gt 0 ]]; then
+    log_pass "Metrics recorded ($METRIC_COUNT violations in DB)"
+else
+    log_fail "Metrics should be recorded" "0 violations in DB"
+fi
+
+# =============================================================================
+# Pre-Write Hook Tests
+# =============================================================================
+echo ""
+echo "=== Pre-Write Hook Tests ==="
+
+# Test: Domain importing Infrastructure should block
+result=$(run_pre_hook "src/Domain/Service/UserService.php" "<?php\nuse App\\\\Infrastructure\\\\Persistence\\\\Repo;\nfinal class UserService {}")
+exit_code="${result%%|*}"
+# The rule is named, not just the exit code. This assertion spent its whole life
+# green on PHP001 blocking instead, and an exit code alone cannot tell the two
+# apart.
+if [[ "$exit_code" == "2" ]] && [[ "$result" == *LAYER001* ]]; then
+    log_pass "Pre-write blocks Domain->Infrastructure import (exit 2, LAYER001)"
+else
+    log_fail "Pre-write should block layer violation" "exit=$exit_code, output=${result#*|}"
+fi
+
+# Test: Valid Domain file should pass
+result=$(run_pre_hook "src/Domain/Entity/User.php" "<?php\ndeclare(strict_types=1);\nnamespace App\\\\Domain\\\\Entity;\nfinal class User {}")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "Pre-write allows valid Domain file (exit 0)"
+else
+    log_fail "Pre-write should allow valid file" "exit=$exit_code"
+fi
+
+# Test: Non-source files should pass silently
+result=$(run_pre_hook "config/services.yaml" "services:\n  App\\:")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "Pre-write ignores non-source files (exit 0)"
+else
+    log_fail "Pre-write should ignore non-source files" "exit=$exit_code"
+fi
+
+# =============================================================================
+# Post-Write Hook - Config-Aware Tests
+# =============================================================================
+echo ""
+echo "=== Post-Write Hook - Config-Aware Tests ==="
+
+# Test: the declared stack does not silence a language pack (#35).
+#
+# These two used to assert the opposite, "stack=react skips PHP rules", and
+# that assertion is what let a polyglot repository lose its packs in silence:
+# a Symfony backend with a React front declared one stack and half its files
+# went unvalidated, exit 0, nothing printed. Dispatch is by extension; the
+# stack selects doctrine and setup hints, never whether a file is validated.
+export CLAUDE_PLUGIN_OPTION_stack="react"
+export CLAUDE_PLUGIN_OPTION_strictness="strict"
+result=$(run_post_hook "$FIXTURES_DIR/invalid-no-strict.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]]; then
+    log_pass "stack=react still refuses a PHP file with a violation (exit 2)"
+else
+    log_fail "stack=react still refuses a PHP file with a violation" "got exit $exit_code"
+fi
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+
+export CLAUDE_PLUGIN_OPTION_stack="symfony"
+result=$(run_post_hook "$FIXTURES_DIR/invalid-any.ts")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]]; then
+    log_pass "stack=symfony still refuses a TS file with a violation (exit 2)"
+else
+    log_fail "stack=symfony still refuses a TS file with a violation" "got exit $exit_code"
+fi
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+
+# Test: strictness=relaxed warns instead of blocking
+export CLAUDE_PLUGIN_OPTION_strictness="relaxed"
+result=$(run_post_hook "$FIXTURES_DIR/invalid-no-strict.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "strictness=relaxed warns PHP001 (exit 0)"
+else
+    log_fail "strictness=relaxed should warn not block" "got exit $exit_code"
+fi
+unset CLAUDE_PLUGIN_OPTION_strictness 2>/dev/null || true
+
+# Test: strictness=moderate blocks LAYER but warns PHP001
+export CLAUDE_PLUGIN_OPTION_strictness="moderate"
+result=$(run_post_hook "$FIXTURES_DIR/invalid-layer-violation.php")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "2" ]] && echo "$output" | grep -q "LAYER"; then
+    log_pass "strictness=moderate reports LAYER violations (exit 2)"
+else
+    log_fail "strictness=moderate should block LAYER" "exit=$exit_code"
+fi
+
+result=$(run_post_hook "$FIXTURES_DIR/invalid-no-strict.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "strictness=moderate warns PHP001 (exit 0)"
+else
+    log_fail "strictness=moderate should warn PHP001" "got exit $exit_code"
+fi
+unset CLAUDE_PLUGIN_OPTION_strictness 2>/dev/null || true
+
+# Test: the default itself, in both of its shapes.
+#
+# `strict` on a repository without history, `moderate` on one with. This is the
+# setting the branch changed, so it is asserted against the hook, not against a
+# helper: the seeded value used to reach the session banner and never the gate.
+DEFAULT_FRESH="$(mktemp -d "${TMPDIR:-/tmp}/craftsman-default-fresh.XXXXXX")"
+( cd "$DEFAULT_FRESH" && git init -q && git commit -q --allow-empty -m one ) >/dev/null 2>&1
+cp "$FIXTURES_DIR/invalid-no-strict.php" "$DEFAULT_FRESH/Sample.php"
+fresh_code=0
+( cd "$DEFAULT_FRESH" && echo "{\"tool_input\":{\"file_path\":\"$DEFAULT_FRESH/Sample.php\"}}" \
+    | CLAUDE_PLUGIN_OPTION_strictness="" bash "$ROOT_DIR/hooks/post-write-check.sh" >/dev/null 2>&1 ) || fresh_code=$?
+if [[ "$fresh_code" == "2" ]]; then
+    log_pass "Default on a repository without history: PHP001 blocks"
+else
+    log_fail "Default on a repository without history should block PHP001" "got exit $fresh_code"
+fi
+
+DEFAULT_AGED="$(mktemp -d "${TMPDIR:-/tmp}/craftsman-default-aged.XXXXXX")"
+( cd "$DEFAULT_AGED" && git init -q && for i in $(seq 1 25); do git commit -q --allow-empty -m "c$i"; done ) >/dev/null 2>&1
+cp "$FIXTURES_DIR/invalid-no-strict.php" "$DEFAULT_AGED/Sample.php"
+aged_code=0
+aged_out=$( cd "$DEFAULT_AGED" && echo "{\"tool_input\":{\"file_path\":\"$DEFAULT_AGED/Sample.php\"}}" \
+    | CLAUDE_PLUGIN_OPTION_strictness="" bash "$ROOT_DIR/hooks/post-write-check.sh" 2>&1 ) || aged_code=$?
+if [[ "$aged_code" == "0" ]]; then
+    log_pass "Default on a repository with history: PHP001 reports without blocking"
+else
+    log_fail "Default on a repository with history should not block PHP001" \
+        "got exit $aged_code: $(echo "$aged_out" | head -2)"
+fi
+rm -rf "$DEFAULT_FRESH" "$DEFAULT_AGED"
+
+# =============================================================================
+# Pre-Write Hook - Config-Aware Tests
+# =============================================================================
+echo ""
+echo "=== Pre-Write Hook - Config-Aware Tests ==="
+
+# Test: the declared stack does not silence the write-time layer gate (#35).
+# This asserted "stack=react skips PHP layer checks" until the gate was keyed
+# on the file's language: a Domain class importing Infrastructure is a layer
+# violation in any repository, whatever stack its config declares.
+export CLAUDE_PLUGIN_OPTION_stack="react"
+export CLAUDE_PLUGIN_OPTION_strictness="strict"
+result=$(run_pre_hook "src/Domain/Service/UserService.php" "<?php\nuse App\\\\Infrastructure\\\\Persistence\\\\Repo;\nfinal class UserService {}")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]] && [[ "$result" == *LAYER001* ]]; then
+    log_pass "Pre-write: stack=react still refuses a PHP layer violation (exit 2, LAYER001)"
+else
+    log_fail "Pre-write: stack=react still refuses a PHP layer violation" "got exit $exit_code"
+fi
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+
+# Test: strictness=relaxed warns instead of blocking layer violations
+export CLAUDE_PLUGIN_OPTION_strictness="relaxed"
+result=$(run_pre_hook "src/Domain/Service/UserService.php" "<?php\nuse App\\\\Infrastructure\\\\Persistence\\\\Repo;\nfinal class UserService {}")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "Pre-write: strictness=relaxed warns layer violation (exit 0)"
+else
+    log_fail "Pre-write: strictness=relaxed should warn" "got exit $exit_code"
+fi
+unset CLAUDE_PLUGIN_OPTION_strictness 2>/dev/null || true
+
+# Test: default still blocks
+result=$(run_pre_hook "src/Domain/Service/UserService.php" "<?php\nuse App\\\\Infrastructure\\\\Persistence\\\\Repo;\nfinal class UserService {}")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]] && [[ "$result" == *LAYER001* ]]; then
+    log_pass "Pre-write: default still blocks layer violations (backward compatible)"
+else
+    log_fail "Pre-write: default should block" "got exit $exit_code"
+fi
+
+# =============================================================================
+# SessionStart Hook Tests
+# =============================================================================
+echo ""
+echo "=== SessionStart Hook Tests ==="
+
+# Backup bridge files - session-start.sh overwrites them with test paths
+_BRIDGE="${HOME}/.claude/craftsman-session-state-path"
+backup_home_bridges
+
+run_session_start() {
+    local output
+    output=$(echo '{}' | HOME="$SESSION_TEST_DIR" bash "$ROOT_DIR/hooks/session-start.sh" 2>/dev/null)
+    local exit_code=$?
+    echo "$exit_code|$output"
+}
+
+ORIGINAL_PWD="$PWD"
+SESSION_TEST_DIR="/tmp/craftsman-session-tests-$$"
+mkdir -p "$SESSION_TEST_DIR"
+cd "$SESSION_TEST_DIR"
+
+# Clean env for session tests
+unset CLAUDE_PLUGIN_OPTION_strictness 2>/dev/null || true
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+
+# Test: Outputs valid JSON
+result=$(run_session_start)
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "0" ]] && echo "$output" | jq . >/dev/null 2>&1; then
+    log_pass "SessionStart outputs valid JSON (exit 0)"
+else
+    log_fail "SessionStart should output valid JSON" "exit=$exit_code"
+fi
+
+# Detection reads every pack's `entry_markers`, not two file names the engine
+# knew. The banner names the packs whose languages are present; the warning
+# compares pack names with the configured stack, and is silent under
+# `fullstack`.
+rm -f package.json
+echo '{}' > composer.json
+result=$(run_session_start)
+output="${result#*|}"
+if echo "$output" | grep -q "Detected: symfony"; then
+    log_pass "SessionStart detects the symfony pack from composer.json"
+else
+    log_fail "SessionStart should detect the symfony pack" "$output"
+fi
+rm -f composer.json
+
+echo '{}' > package.json
+result=$(run_session_start)
+output="${result#*|}"
+if echo "$output" | grep -q "Detected: react"; then
+    log_pass "SessionStart detects the react pack from package.json"
+else
+    log_fail "SessionStart should detect the react pack" "$output"
+fi
+rm -f package.json
+
+# The case the literal detector could never see: a Go project.
+printf 'module example.com/x\n' > go.mod
+result=$(run_session_start)
+output="${result#*|}"
+if echo "$output" | grep -q "Detected: go"; then
+    log_pass "SessionStart detects the go pack from go.mod (a marker only the pack declares)"
+else
+    log_fail "SessionStart should detect the go pack from go.mod" "$output"
+fi
+rm -f go.mod
+
+echo '{}' > composer.json
+echo '{}' > package.json
+result=$(run_session_start)
+output="${result#*|}"
+if echo "$output" | grep -q "Detected: react,symfony" && ! echo "$output" | grep -q "Warning: config says"; then
+    log_pass "SessionStart names both packs and warns of nothing under fullstack"
+else
+    log_fail "SessionStart names both packs and warns of nothing under fullstack" "$output"
+fi
+result=$(CLAUDE_PLUGIN_OPTION_STACK=symfony run_session_start)
+output="${result#*|}"
+if echo "$output" | grep -q "config says 'symfony' but this project carries react"; then
+    log_pass "SessionStart warns when the stack names one pack and another pack's language is present"
+else
+    log_fail "SessionStart warns when the stack names one pack and another pack's language is present" "$output"
+fi
+rm -f composer.json package.json
+
+# Test: Suggests setup when no .craft-config.yml
+result=$(run_session_start)
+output="${result#*|}"
+if echo "$output" | grep -q "craft-config\|setup"; then
+    log_pass "SessionStart suggests /craftsman:setup when no config"
+else
+    log_fail "SessionStart should suggest setup" "$output"
+fi
+
+# Test: No setup suggestion when .craft-config.yml exists
+cat > "$SESSION_TEST_DIR/.craft-config.yml" <<'YAML'
+strictness: strict
+stack: fullstack
+YAML
+result=$(run_session_start)
+output="${result#*|}"
+if ! echo "$output" | grep -q "Run /craftsman:setup to configure"; then
+    log_pass "SessionStart silent about setup when config exists"
+else
+    log_fail "SessionStart should not suggest setup" "$output"
+fi
+rm -f .craft-config.yml
+
+# Test: Always exits 0
+result=$(run_session_start)
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "SessionStart always exits 0 (non-blocking)"
+else
+    log_fail "SessionStart should always exit 0" "got exit $exit_code"
+fi
+
+# Restore bridge files after session-start tests
+restore_home_bridges
+
+cd "$ORIGINAL_PWD"
+rm -rf "$SESSION_TEST_DIR"
+
+# =============================================================================
+# FileChanged Hook Tests - wired in hooks.json with matcher *.php|*.ts|*.tsx
+# =============================================================================
+echo ""
+echo "=== FileChanged Hook Tests ==="
+
+run_file_changed() {
+    local file_path="$1"
+    local output
+    output=$(jq -n --arg fp "$file_path" '{"file_path":$fp}' | bash "$ROOT_DIR/hooks/file-changed.sh" 2>/dev/null)
+    local exit_code=$?
+    echo "$exit_code|$output"
+}
+
+# Clear env
+unset CLAUDE_PLUGIN_OPTION_strictness 2>/dev/null || true
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+
+# Test: Ignores files no loaded pack claims.
+#
+# This used to pass tests/run-tests.sh, on the assumption that a .sh file was
+# not source. The bash pack claims .sh, so that assumption stopped being true
+# the day it shipped, and the hook only kept agreeing with it because its
+# extension list was a literal php|ts|tsx. Use a file no pack declares.
+result=$(run_file_changed "$ROOT_DIR/README.md")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "0" ]] && [[ -z "$output" ]]; then
+    log_pass "FileChanged ignores files no loaded pack claims (silent exit 0)"
+else
+    log_fail "FileChanged should ignore non-source files" "exit=$exit_code output=$output"
+fi
+
+# Test: a language contributed by a pack other than symfony/react is seen here
+# too. The assertion above no longer covers .sh, so this replaces the coverage
+# rather than dropping it: FileChanged and post-write-check must agree on what
+# counts as source, and they disagreed for as long as each held its own list.
+result=$(run_file_changed "$FIXTURES_DIR/unsafe.sh")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "0" ]] && echo "$output" | grep -qE 'SH00[0-9]'; then
+    log_pass "FileChanged reports bash rules, so packs beyond php/ts reach it"
+else
+    log_fail "FileChanged should report bash rules" "exit=$exit_code output=$output"
+fi
+
+# Test: Detects PHP violations (non-blocking)
+result=$(run_file_changed "$FIXTURES_DIR/invalid-no-strict.php")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "0" ]] && echo "$output" | grep -q "PHP001"; then
+    log_pass "FileChanged detects PHP001 (non-blocking, exit 0)"
+else
+    log_fail "FileChanged should detect PHP001" "exit=$exit_code"
+fi
+
+# Test: Detects TS violations (non-blocking)
+result=$(run_file_changed "$FIXTURES_DIR/invalid-any.ts")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "0" ]] && echo "$output" | grep -q "TS001"; then
+    log_pass "FileChanged detects TS001 (non-blocking, exit 0)"
+else
+    log_fail "FileChanged should detect TS001" "exit=$exit_code"
+fi
+
+# Test: Silent when file is clean
+result=$(run_file_changed "$FIXTURES_DIR/valid-entity.php")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "0" ]] && [[ -z "$output" ]]; then
+    log_pass "FileChanged silent on clean file"
+else
+    log_fail "FileChanged should be silent on clean file" "output=$output"
+fi
+
+# Test: the declared stack does not silence a language pack here either (#35).
+# Same flip as the post-write cases above: FileChanged and post-write-check
+# must agree on what counts as source, and both used to agree on the hole.
+export CLAUDE_PLUGIN_OPTION_stack="react"
+result=$(run_file_changed "$FIXTURES_DIR/invalid-no-strict.php")
+output="${result#*|}"
+if echo "$output" | grep -q "PHP001"; then
+    log_pass "FileChanged reports PHP001 on a PHP file under stack=react"
+else
+    log_fail "FileChanged reports PHP001 on a PHP file under stack=react" "output=$output"
+fi
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+
+export CLAUDE_PLUGIN_OPTION_stack="symfony"
+result=$(run_file_changed "$FIXTURES_DIR/invalid-any.ts")
+output="${result#*|}"
+if echo "$output" | grep -q "TS001"; then
+    log_pass "FileChanged reports TS001 on a TS file under stack=symfony"
+else
+    log_fail "FileChanged reports TS001 on a TS file under stack=symfony" "output=$output"
+fi
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+
+# Test: Always non-blocking (exit 0)
+result=$(run_file_changed "$FIXTURES_DIR/invalid-layer-violation.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "FileChanged always exits 0 (even on LAYER violations)"
+else
+    log_fail "FileChanged should always exit 0" "got exit $exit_code"
+fi
+
+# =============================================================================
+# Agent Hook Schema Tests
+# =============================================================================
+echo ""
+echo "=== Agent Hook Schema Tests ==="
+
+HOOKS_FILE="$ROOT_DIR/hooks/hooks.json"
+
+# Test: PostToolUse Write|Edit has post-write-check + async DDD verifier (ADR-0018)
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+hooks = d['hooks']['PostToolUse'][0]['hooks']
+assert len(hooks) == 2, f'Expected 2 hooks, got {len(hooks)}'
+assert 'post-write-check.sh' in hooks[0]['command']
+ddd = hooks[1]
+assert 'agent-ddd-verifier.sh' in ddd['command']
+assert ddd.get('async') is True and ddd.get('asyncRewake') is True
+m = d['hooks']['PostToolUse'][0].get('matcher','')
+assert 'write' in m.split('|') and 'search_replace' in m.split('|'), m
+" 2>/dev/null; then
+    log_pass "PostToolUse: post-write-check + async DDD verifier (asyncRewake)"
+else
+    log_fail "PostToolUse hook group" "expected post-write-check + async ddd-verifier"
+fi
+
+# Test: DDD verifier is NOT on Stop anymore (dead there: no tool_input) and
+# final review rewakes on Stop (ADR-0018)
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+stop_hooks = d['hooks']['Stop'][0]['hooks']
+assert not any('agent-ddd-verifier.sh' in h['command'] for h in stop_hooks)
+fr = [h for h in stop_hooks if 'agent-final-review.sh' in h['command']]
+assert len(fr) == 1 and fr[0].get('async') is True and fr[0].get('asyncRewake') is True
+" 2>/dev/null; then
+    log_pass "Stop group: DDD verifier removed, final review async+asyncRewake"
+else
+    log_fail "Stop hook group" "expected final-review asyncRewake, no ddd-verifier"
+fi
+
+# Test: DDD verifier script has the agent_hooks gate, through the one resolver
+# (config_agent_hooks_enabled reads the exported option, then the global
+# file; tests/core/test-agent-hooks.sh proves the call is not made).
+if grep -q 'config_agent_hooks_enabled || exit 0' "$ROOT_DIR/hooks/agent-ddd-verifier.sh" 2>/dev/null; then
+    log_pass "DDD verifier script gates on config_agent_hooks_enabled"
+else
+    log_fail "DDD verifier gate" "missing config_agent_hooks_enabled gate"
+fi
+
+# Test: Sentry context in Stop hook (moved from PostToolUse for latency reduction)
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+stop_hooks = d['hooks']['Stop'][0]['hooks']
+sentry_found = any('agent-sentry-context.sh' in h['command'] for h in stop_hooks)
+assert sentry_found, 'Sentry context not found in Stop hooks'
+" 2>/dev/null; then
+    log_pass "Stop Sentry context: command hook with gate script"
+else
+    log_fail "Sentry context hook" "missing or invalid"
+fi
+
+# Test: Sentry context script has sentry_org gate
+if grep -q 'CLAUDE_PLUGIN_OPTION_sentry_org' "$ROOT_DIR/hooks/agent-sentry-context.sh" 2>/dev/null; then
+    log_pass "Sentry context script contains sentry_org gate"
+else
+    log_fail "Sentry context gate" "missing CLAUDE_PLUGIN_OPTION_sentry_org check"
+fi
+
+# InstructionsLoaded is side-effects only: exit codes and JSON are ignored, so
+# a context injector wired there silently reaches nobody. The old
+# agent-structure-analyzer.sh did exactly that for two releases. Agents now get
+# their context by running dispatch-context.sh as their first action.
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+assert 'InstructionsLoaded' not in d['hooks']
+" 2>/dev/null; then
+    log_pass "No hook wired on InstructionsLoaded (side-effects-only event)"
+else
+    log_fail "InstructionsLoaded" "a hook is wired on a side-effects-only event - it cannot inject context"
+fi
+
+# Test: dispatch-context replaces the dead injector and stays non-blocking
+if [[ -f "$ROOT_DIR/hooks/lib/dispatch-context.sh" ]]; then
+    log_pass "dispatch-context.sh exists (agent context source)"
+else
+    log_fail "dispatch-context" "hooks/lib/dispatch-context.sh missing"
+fi
+
+DC_EXIT=0
+DC_OUT=$(cd "$ROOT_DIR" && bash hooks/lib/dispatch-context.sh 2>/dev/null) || DC_EXIT=$?
+if [[ $DC_EXIT -eq 0 && "$DC_OUT" == *"Dispatch Context"* ]]; then
+    log_pass "dispatch-context.sh exits 0 and emits context"
+else
+    log_fail "dispatch-context run" "exit=$DC_EXIT, output header missing"
+fi
+
+if echo "$DC_OUT" | grep -q "Engineering Doctrine"; then
+    log_pass "dispatch-context includes resolved doctrine"
+else
+    log_fail "dispatch-context doctrine" "doctrine section missing from output"
+fi
+
+# Test: Stop has 3 command hooks (dismissal guard, sentry-context,
+# final-review); the DDD verifier lives on PostToolUse in v4 (ADR-0018)
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+hooks = d['hooks']['Stop'][0]['hooks']
+assert len(hooks) == 3, f'Expected 3 Stop hooks, got {len(hooks)}'
+assert all(h['type'] == 'command' for h in hooks)
+names = [h['command'] for h in hooks]
+for script in ('test-dismissal-guard.sh', 'agent-sentry-context.sh', 'agent-final-review.sh'):
+    assert any(script in n for n in names), script
+" 2>/dev/null; then
+    log_pass "Stop: 3 command hooks (dismissal guard, sentry, final-review)"
+else
+    log_fail "Stop hook" "missing or invalid"
+fi
+
+# Test: Final review script contains strictness gate
+if grep -q 'CLAUDE_PLUGIN_OPTION_strictness' "$ROOT_DIR/hooks/agent-final-review.sh" 2>/dev/null; then
+    log_pass "Final review script contains strictness gate"
+else
+    log_fail "Final review gate" "missing CLAUDE_PLUGIN_OPTION_strictness check"
+fi
+
+# Test: post-write-check.sh command hook still present
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+hooks = d['hooks']['PostToolUse'][0]['hooks']
+assert 'post-write-check.sh' in hooks[0]['command']
+" 2>/dev/null; then
+    log_pass "PostToolUse post-write-check.sh command hook present"
+else
+    log_fail "PostToolUse command hook" "missing or modified"
+fi
+
+# =============================================================================
+# New Hook Events Tests (v3.1 - PostToolUseFailure, FileChanged, SubagentStop, PreCompact)
+# =============================================================================
+echo ""
+echo "=== New Hook Events Tests ==="
+
+# Test: PostToolUseFailure event wired with async. Two handlers: the failure
+# tracker, and the test verifier, because a Bash command that exits non-zero
+# is this event on Claude Code and never a PostToolUse (the fixture
+# post-tool-use-failure.bash.exit1-tests-failed.json); the verifier's
+# regression path needs asyncRewake to wake the session from here.
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+hooks = d['hooks']['PostToolUseFailure'][0]['hooks']
+assert len(hooks) == 2
+assert all(h.get('async') == True for h in hooks), 'Expected async: true'
+assert 'tool-failure-tracker.sh' in hooks[0]['command']
+assert 'post-bash-test-verify.sh' in hooks[1]['command']
+assert hooks[1].get('asyncRewake') == True, 'the regression exit 2 must rewake'
+" 2>/dev/null; then
+    log_pass "PostToolUseFailure: async tool-failure-tracker and post-bash-test-verify (asyncRewake) hooks"
+else
+    log_fail "PostToolUseFailure hook" "missing or invalid"
+fi
+
+# Test: FileChanged event wired with matcher and async
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+fc = d['hooks']['FileChanged'][0]
+m = fc.get('matcher', '')
+assert m and '*' not in m and all(p.endswith('/') for p in m.split('|')), f'matcher must list directories: {m!r}'
+assert fc['hooks'][0].get('async') == True
+assert 'file-changed.sh' in fc['hooks'][0]['command']
+" 2>/dev/null; then
+    log_pass "FileChanged: async file-changed hook watching directories (the form the event supports)"
+else
+    log_fail "FileChanged hook" "missing or invalid"
+fi
+
+# Test: SubagentStop event wired with async
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+hooks = d['hooks']['SubagentStop'][0]['hooks']
+assert len(hooks) == 1
+assert hooks[0].get('async') == True
+assert 'subagent-quality-gate.sh' in hooks[0]['command']
+" 2>/dev/null; then
+    log_pass "SubagentStop: async subagent-quality-gate hook"
+else
+    log_fail "SubagentStop hook" "missing or invalid"
+fi
+
+# Test: PreCompact event wired (non-async - must complete before compaction)
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+hooks = d['hooks']['PreCompact'][0]['hooks']
+assert len(hooks) == 1
+assert hooks[0].get('async', False) == False, 'PreCompact must be synchronous'
+assert 'pre-compact-save.sh' in hooks[0]['command']
+" 2>/dev/null; then
+    log_pass "PreCompact: synchronous pre-compact-save hook"
+else
+    log_fail "PreCompact hook" "missing or invalid"
+fi
+
+# Test: the agent Stop hooks are async (they call a model; the session end
+# must not wait on them). The dismissal guard is the one synchronous Stop
+# hook: an async hook cannot keep the turn open, and it reads only the
+# session state and the payload (CR-289).
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+hooks = d['hooks']['Stop'][0]['hooks']
+agents = [h for h in hooks if '/hooks/agent-' in h['command']]
+assert len(agents) == 2 and all(h.get('async') == True for h in agents), 'agent Stop hooks should be async'
+sync = [h for h in hooks if not h.get('async')]
+assert len(sync) == 1 and 'test-dismissal-guard.sh' in sync[0]['command'], 'only the dismissal guard is synchronous'
+" 2>/dev/null; then
+    log_pass "Stop hooks: agent hooks async, the dismissal guard alone synchronous"
+else
+    log_fail "Stop hooks async" "expected the agent hooks async and only test-dismissal-guard.sh synchronous"
+fi
+
+# Test: PreToolUse Bash handler carries the conditional if field (handler level, where Claude Code reads it)
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+bash_entry = d['hooks']['PreToolUse'][1]
+handler = next(h for h in bash_entry['hooks'] if 'pre-push-verify.sh' in h['command'])
+assert handler.get('if') is not None, 'Expected if field on the Bash PreToolUse handler'
+assert 'git push' in handler['if'], f'Expected git push in if, got: {handler[\"if\"]}'
+" 2>/dev/null; then
+    log_pass "PreToolUse Bash: handler-level if for git push"
+else
+    log_fail "PreToolUse conditional" "missing if field"
+fi
+
+# Test: New hook scripts exist and are executable
+for script in tool-failure-tracker.sh subagent-quality-gate.sh pre-compact-save.sh; do
+    if [[ -x "$ROOT_DIR/hooks/$script" ]]; then
+        log_pass "$script exists and is executable"
+    else
+        log_fail "$script" "missing or not executable"
+    fi
+done
+
+# Test: PostCompact event wired (synchronous - verify state after compaction)
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+hooks = d['hooks']['PostCompact'][0]['hooks']
+assert len(hooks) == 1
+assert hooks[0].get('async', False) == False, 'PostCompact must be synchronous'
+assert 'post-compact-verify.sh' in hooks[0]['command']
+" 2>/dev/null; then
+    log_pass "PostCompact: synchronous post-compact-verify hook"
+else
+    log_fail "PostCompact verify hook" "missing or invalid"
+fi
+
+# Test: post-compact-verify.sh exists and is executable
+if [[ -x "$ROOT_DIR/hooks/post-compact-verify.sh" ]]; then
+    log_pass "post-compact-verify.sh exists and is executable"
+else
+    log_fail "post-compact-verify.sh" "missing or not executable"
+fi
+
+# Test: Total hook event count (12 events wired; TaskCompleted added in v4,
+# InstructionsLoaded dropped: side-effects only, its injector never reached agents)
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+events = list(d['hooks'].keys())
+assert len(events) == 12, f'Expected 12 hook events, got {len(events)}: {events}'
+assert 'TaskCompleted' in events
+assert 'InstructionsLoaded' not in events
+" 2>/dev/null; then
+    log_pass "Total hook events: 12 (TaskCompleted wired, InstructionsLoaded dropped)"
+else
+    log_fail "Hook event count" "expected 12 incl. TaskCompleted, excl. InstructionsLoaded"
+fi
+
+# =============================================================================
+# Plugin Integrity Tests (badges, bin/)
+# =============================================================================
+echo ""
+echo "=== Plugin Integrity Tests ==="
+
+# Test: bin/ executables exist
+for exe in craftsman-ci craftsman-validate; do
+    if [[ -x "$ROOT_DIR/bin/$exe" ]]; then
+        log_pass "bin/$exe exists and is executable"
+    else
+        log_fail "bin/$exe" "missing or not executable"
+    fi
+done
+
+# Test: output-styles removed in v4 (ADR-0016)
+if [[ ! -d "$ROOT_DIR/output-styles" ]]; then
+    log_pass "output-styles/ removed (v4 clean break)"
+else
+    log_fail "output-styles" "directory should not exist in v4"
+fi
+
+# Test: every agent declares a valid effort level.
+# Agents carry effort in their own frontmatter, not in plugin.json - an earlier
+# version of this test read a plugin.json key that does not exist, so it passed
+# vacuously. Valid values are Claude Code's effort levels.
+if python3 -c "
+import glob, os, sys
+
+invalid = []
+for path in sorted(glob.glob('$ROOT_DIR/agents/*.md')):
+    lines = open(path).read().splitlines()
+    if not lines or lines[0] != '---':
+        continue
+    end = next((i for i, l in enumerate(lines[1:], 1) if l == '---'), None)
+    effort = next(
+        (l.split(':', 1)[1].strip() for l in lines[1:end] if l.startswith('effort:')),
+        None,
+    )
+    if effort not in {'low', 'medium', 'high', 'xhigh', 'max'}:
+        invalid.append(f'{os.path.basename(path)}={effort}')
+
+assert not invalid, f'Invalid or missing agent effort: {invalid}'
+" 2>/dev/null; then
+    log_pass "All agents declare a valid effort level"
+else
+    log_fail "Agent effort levels" "invalid or missing effort in agents/*.md"
+fi
+
+# =============================================================================
+# Channel Lifecycle Tests
+# =============================================================================
+echo ""
+echo "=== Channel Lifecycle Tests ==="
+
+source "$ROOT_DIR/hooks/lib/channels.sh" 2>/dev/null
+
+# Test: channel_available "sentry" returns false when not configured
+unset CLAUDE_PLUGIN_OPTION_sentry_org 2>/dev/null || true
+unset CLAUDE_PLUGIN_OPTION_sentry_project 2>/dev/null || true
+if ! channel_available "sentry"; then
+    log_pass "channel_available 'sentry' false when not configured"
+else
+    log_fail "channel_available should be false" "returned true"
+fi
+
+# Test: channel_available "sentry" returns true when configured
+export CLAUDE_PLUGIN_OPTION_sentry_org="test-org"
+export CLAUDE_PLUGIN_OPTION_sentry_project="test-project"
+if channel_available "sentry"; then
+    log_pass "channel_available 'sentry' true when configured"
+else
+    log_fail "channel_available should be true" "returned false"
+fi
+
+# Test: channel_available "unknown" returns false
+if ! channel_available "unknown"; then
+    log_pass "channel_available 'unknown' returns false"
+else
+    log_fail "channel_available 'unknown'" "returned true"
+fi
+
+# Test: channel_status_summary empty when no channels
+unset CLAUDE_PLUGIN_OPTION_sentry_org 2>/dev/null || true
+unset CLAUDE_PLUGIN_OPTION_sentry_project 2>/dev/null || true
+result=$(channel_status_summary)
+if [[ -z "$(echo "$result" | tr -d ' ')" ]]; then
+    log_pass "channel_status_summary empty when no channels active"
+else
+    log_fail "channel_status_summary should be empty" "got '$result'"
+fi
+
+# Test: channel_status_summary shows sentry when configured
+export CLAUDE_PLUGIN_OPTION_sentry_org="test-org"
+export CLAUDE_PLUGIN_OPTION_sentry_project="test-project"
+result=$(channel_status_summary)
+if echo "$result" | grep -qE "sentry:(enabled|closed|open|half-open)"; then
+    log_pass "channel_status_summary shows sentry with valid state"
+else
+    log_fail "channel_status_summary" "got '$result', expected 'sentry:<state>'"
+fi
+
+unset CLAUDE_PLUGIN_OPTION_sentry_org 2>/dev/null || true
+unset CLAUDE_PLUGIN_OPTION_sentry_project 2>/dev/null || true
+
+# =============================================================================
+# Correction Learning Tests
+# =============================================================================
+echo ""
+echo "=== Correction Learning Tests ==="
+
+source "$ROOT_DIR/hooks/lib/metrics-db.sh"
+metrics_init 2>/dev/null || true
+
+# Test: corrections table exists after init
+if sqlite3 "$METRICS_DB" ".tables" 2>/dev/null | grep -q "corrections"; then
+    log_pass "corrections table created by metrics_init"
+else
+    log_fail "corrections table" "not created"
+fi
+
+# Test: metrics_record_correction writes to DB
+metrics_record_correction "PHP002" "src/Domain/**/*.php" "fixed" "removed public setter" 2>/dev/null
+CORR_COUNT=$(sqlite3 "$METRICS_DB" "SELECT COUNT(*) FROM corrections;" 2>/dev/null || echo 0)
+if [[ "$CORR_COUNT" -ge 1 ]]; then
+    log_pass "metrics_record_correction writes to corrections table"
+else
+    log_fail "metrics_record_correction" "no rows inserted"
+fi
+
+# Test: metrics_record_correction stores correct action
+ACTION=$(sqlite3 "$METRICS_DB" "SELECT action FROM corrections ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+if [[ "$ACTION" == "fixed" ]]; then
+    log_pass "metrics_record_correction stores action='fixed'"
+else
+    log_fail "correction action" "got '$ACTION', expected 'fixed'"
+fi
+
+# Test: metrics_record_correction handles 'ignored' action
+metrics_record_correction "TS003" "src/**/*.ts" "ignored" "craftsman-ignore added" 2>/dev/null
+ACTION=$(sqlite3 "$METRICS_DB" "SELECT action FROM corrections WHERE rule='TS003' LIMIT 1;" 2>/dev/null)
+if [[ "$ACTION" == "ignored" ]]; then
+    log_pass "metrics_record_correction stores action='ignored'"
+else
+    log_fail "correction ignored action" "got '$ACTION'"
+fi
+
+# Test: metrics_corrections_30d returns summary
+SUMMARY=$(metrics_corrections_30d 2>/dev/null)
+if echo "$SUMMARY" | grep -q "PHP002"; then
+    log_pass "metrics_corrections_30d includes PHP002 in summary"
+else
+    log_fail "metrics_corrections_30d" "missing PHP002"
+fi
+
+# =============================================================================
+# Session State & Correction Detection Tests
+# =============================================================================
+echo ""
+echo "=== Session State & Correction Detection Tests ==="
+
+SESSION_STATE="${CLAUDE_PLUGIN_DATA}/session-state.json"
+
+# Test: Session state file created when violation blocks
+rm -f "$SESSION_STATE"
+# These assert what happens ON a block, so they need a blocking severity, and
+# the ambient default no longer guarantees one: this suite runs inside a
+# repository with history, which now seeds `moderate`.
+export CLAUDE_PLUGIN_OPTION_strictness="strict"
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+result=$(run_post_hook "$FIXTURES_DIR/invalid-no-strict.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]] && [[ -f "$SESSION_STATE" ]]; then
+    log_pass "Session state file created on block"
+else
+    log_fail "Session state file" "exit=$exit_code, file exists=$(test -f "$SESSION_STATE" && echo yes || echo no)"
+fi
+
+# Test: Session state contains the blocked rule
+if [[ -f "$SESSION_STATE" ]] && python3 -c "
+import json
+d = json.load(open('$SESSION_STATE'))
+bv = d.get('blocked_violations', {})
+found = any('PHP001' in rules for rules in bv.values())
+assert found, 'PHP001 not in blocked_violations'
+" 2>/dev/null; then
+    log_pass "Session state records PHP001 for blocked file"
+else
+    log_fail "Session state content" "PHP001 not recorded"
+fi
+
+# Test: Session state cleared at SessionEnd
+echo '{"session_duration_seconds": 10}' | bash "$ROOT_DIR/hooks/session-metrics.sh" 2>/dev/null
+if [[ ! -f "$SESSION_STATE" ]]; then
+    log_pass "Session state cleared at SessionEnd"
+else
+    log_fail "Session state should be cleared at SessionEnd" "file still exists"
+fi
+
+# =============================================================================
+# craftsman-ignore Multi-Rule Tests
+# =============================================================================
+echo ""
+echo "=== craftsman-ignore Multi-Rule Tests ==="
+
+# Test: multi-rule craftsman-ignore suppresses all listed rules (exit 0)
+result=$(run_post_hook "$FIXTURES_DIR/with-craftsman-ignore-multi.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "craftsman-ignore multi-rule suppresses violations (exit 0)"
+else
+    log_fail "craftsman-ignore multi-rule should suppress" "got exit $exit_code"
+fi
+
+# Test: single-rule craftsman-ignore still works (backward compat)
+result=$(run_post_hook "$FIXTURES_DIR/with-craftsman-ignore.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "craftsman-ignore single-rule backward compatible (exit 0)"
+else
+    log_fail "craftsman-ignore single-rule backward compat" "got exit $exit_code"
+fi
+
+# Test: line_has_ignore function matches single rule
+source "$ROOT_DIR/hooks/lib/config.sh"
+source "$ROOT_DIR/hooks/lib/metrics-db.sh"
+
+# Inline test: verify line_has_ignore logic for comma-separated rules
+FILE_PATH="$FIXTURES_DIR/with-craftsman-ignore-multi.php"
+FILE_PATTERN=$(metrics_file_pattern "$FILE_PATH" 2>/dev/null || echo "test/**/*.php")
+EXT="php"
+
+line_has_ignore_test() {
+    local line="$1"
+    local rule="$2"
+    if echo "$line" | grep -qE "craftsman-ignore:\s*[^#]*\b${rule}\b" 2>/dev/null; then
+        return 0
+    fi
+    if echo "$line" | grep -qE "craftsman-ignore\s*$" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+if line_has_ignore_test "// craftsman-ignore: PHP001, TS001, LAYER001" "PHP001"; then
+    log_pass "line_has_ignore matches first rule in multi-rule list"
+else
+    log_fail "line_has_ignore should match PHP001 in multi-rule" ""
+fi
+
+if line_has_ignore_test "// craftsman-ignore: PHP001, TS001, LAYER001" "LAYER001"; then
+    log_pass "line_has_ignore matches last rule in multi-rule list"
+else
+    log_fail "line_has_ignore should match LAYER001 in multi-rule" ""
+fi
+
+if ! line_has_ignore_test "// craftsman-ignore: PHP001, TS001" "PHP002"; then
+    log_pass "line_has_ignore does NOT match absent rule"
+else
+    log_fail "line_has_ignore should not match PHP002 not in list" ""
+fi
+
+if line_has_ignore_test "// craftsman-ignore: no-setter, PHP003" "PHP003"; then
+    log_pass "line_has_ignore matches rule mixed with non-code token"
+else
+    log_fail "line_has_ignore should match PHP003 in mixed list" ""
+fi
+
+# =============================================================================
+# Cross-File Correction Pattern Tests
+# =============================================================================
+echo ""
+echo "=== Cross-File Correction Pattern Tests ==="
+
+# Simulate multiple file violations in session state to trigger pattern detection
+PATTERN_TEST_STATE="${CLAUDE_PLUGIN_DATA}/session-state.json"
+mkdir -p "$(dirname "$PATTERN_TEST_STATE")"
+
+# Write a session state with 3 files violating PHP001 in same directory
+python3 -c "
+import json, sys
+state = {
+    'blocked_violations': {
+        'src/Domain/**/*.php': ['PHP001'],
+        'src/Domain/Entity/**/*.php': ['PHP001'],
+        'src/Domain/ValueObject/**/*.php': ['PHP001'],
+    },
+    'patterns': {
+        'PHP001': {
+            'src/Domain': [
+                'src/Domain/**/*.php',
+                'src/Domain/Entity/**/*.php',
+                'src/Domain/ValueObject/**/*.php',
+            ]
+        }
+    }
+}
+with open(sys.argv[1], 'w') as f:
+    json.dump(state, f)
+" "$PATTERN_TEST_STATE" 2>/dev/null
+
+# Test: _detect_cross_file_patterns outputs PROJECT-WIDE PATTERN for 3+ files
+PATTERN_OUTPUT=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    state = json.load(f)
+patterns = state.get('patterns', {})
+suggestions = []
+for rule, dir_map in patterns.items():
+    all_files = set()
+    for files in dir_map.values():
+        all_files.update(files)
+    if len(all_files) >= 3:
+        suggestions.append('PATTERN:' + rule + ':' + str(len(all_files)) + ' files')
+    for dir_b, files in dir_map.items():
+        if len(files) >= 2 and dir_b not in ('', '.'):
+            suggestions.append('DIR_PATTERN:' + rule + ':' + dir_b + ':' + str(len(files)) + ' files')
+for s in suggestions:
+    print(s)
+" "$PATTERN_TEST_STATE" 2>/dev/null)
+
+if echo "$PATTERN_OUTPUT" | grep -q "^PATTERN:PHP001"; then
+    log_pass "Cross-file patterns: PHP001 in 3+ files triggers PROJECT-WIDE PATTERN"
+else
+    log_fail "Cross-file pattern detection" "expected PATTERN:PHP001, got: $PATTERN_OUTPUT"
+fi
+
+if echo "$PATTERN_OUTPUT" | grep -q "^DIR_PATTERN:PHP001:src/Domain"; then
+    log_pass "Cross-file patterns: PHP001 in directory triggers DIR_PATTERN"
+else
+    log_fail "Directory pattern detection" "expected DIR_PATTERN:PHP001:src/Domain"
+fi
+
+# Test: the hook itself says PROJECT-WIDE PATTERN, through the real path.
+#
+# The inline detection above proves the arithmetic; this proves the hook
+# reports it. The two used to be separate interpreter starts (record, then
+# detect from a re-read of the state); they are one start now, and a wiring
+# error between them would have left the arithmetic green and the user
+# never told.
+export CLAUDE_PLUGIN_OPTION_strictness="strict"
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+PATTERN_REPO="$(mktemp -d "${TMPDIR:-/tmp}/craftsman-pattern.XXXXXX")"
+mkdir -p "$PATTERN_REPO/src/Domain" "$PATTERN_REPO/src/App" "$PATTERN_REPO/src/Infra"
+( cd "$PATTERN_REPO" && git init -q ) >/dev/null 2>&1
+rm -f "$PATTERN_TEST_STATE"
+THIRD_OUTPUT=""
+for bucket in Domain App Infra; do
+    printf '<?php\nclass %s { public function setX($v) { $this->x = $v; } }\n' "$bucket" > "$PATTERN_REPO/src/$bucket/$bucket.php"
+    THIRD_OUTPUT=$(echo "{\"tool_input\":{\"file_path\":\"$PATTERN_REPO/src/$bucket/$bucket.php\"}}" \
+        | ( cd "$PATTERN_REPO" && bash "$ROOT_DIR/hooks/post-write-check.sh" 2>&1 ))
+done
+rm -rf "$PATTERN_REPO"
+if echo "$THIRD_OUTPUT" | grep -q "PROJECT-WIDE PATTERN: PHP001 found in 3 files"; then
+    log_pass "Cross-file patterns: the third blocked file is told PROJECT-WIDE PATTERN by the hook"
+else
+    log_fail "Cross-file patterns: the third blocked file is told PROJECT-WIDE PATTERN by the hook" \
+        "$(echo "$THIRD_OUTPUT" | grep -i "pattern" | head -3)"
+fi
+
+# Test: session state has 'patterns' key after a blocked violation
+rm -f "$PATTERN_TEST_STATE"
+# A blocked violation is the precondition here, so the severity is pinned.
+export CLAUDE_PLUGIN_OPTION_strictness="strict"
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+run_post_hook "$FIXTURES_DIR/invalid-no-strict.php" > /dev/null 2>&1 || true
+
+if [[ -f "$PATTERN_TEST_STATE" ]] && python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    state = json.load(f)
+assert 'patterns' in state, 'patterns key missing'
+" "$PATTERN_TEST_STATE" 2>/dev/null; then
+    log_pass "Session state contains 'patterns' key after block"
+else
+    log_fail "Session state 'patterns' key" "not present after block"
+fi
+
+# =============================================================================
+# Pre-Push Verify Hook Tests
+# =============================================================================
+echo ""
+echo "=== Pre-Push Verify Hook Tests ==="
+
+# Redirect bridge file to test session-state so the hook reads test data
+_BRIDGE="${HOME}/.claude/craftsman-session-state-path"
+_BRIDGE_BAK_PUSH="${_BRIDGE}.push-test-backup"
+[[ -f "$_BRIDGE" ]] && cp "$_BRIDGE" "$_BRIDGE_BAK_PUSH"
+printf '%s' "${CLAUDE_PLUGIN_DATA}/session-state.json" > "$_BRIDGE"
+
+run_pre_push() {
+    local command="$1"
+    local output
+    output=$(jq -n --arg cmd "$command" '{"tool_input":{"command":$cmd}}' | bash "$ROOT_DIR/hooks/pre-push-verify.sh" 2>/dev/null)
+    local exit_code=$?
+    echo "$exit_code|$output"
+}
+
+# Test: non-push command passes silently (exit 0)
+result=$(run_pre_push "git status")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "pre-push-verify: non-push command passes (exit 0)"
+else
+    log_fail "pre-push-verify: non-push command should pass" "got exit $exit_code"
+fi
+
+# Test: git push without verified flag warns but allows (exit 0)
+rm -f "${CLAUDE_PLUGIN_DATA}/session-state.json"
+result=$(run_pre_push "git push origin main")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "0" ]] && echo "$output" | grep -q "WARNING"; then
+    log_pass "pre-push-verify: warns on unverified push but allows (exit 0)"
+else
+    log_fail "pre-push-verify: should warn on unverified push" "exit=$exit_code output=$output"
+fi
+
+# Test: git push with verified=true in session state passes (exit 0)
+mkdir -p "$CLAUDE_PLUGIN_DATA"
+python3 -c "
+import json, sys
+with open(sys.argv[1], 'w') as f:
+    json.dump({'verified': True}, f)
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null
+result=$(run_pre_push "git push origin main")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "pre-push-verify: passes when verified=true (exit 0)"
+else
+    log_fail "pre-push-verify: should pass when verified" "got exit $exit_code"
+fi
+
+# Test: git push --force warns but allows without verified
+rm -f "${CLAUDE_PLUGIN_DATA}/session-state.json"
+result=$(run_pre_push "git push --force origin main")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "pre-push-verify: warns on git push --force but allows (exit 0)"
+else
+    log_fail "pre-push-verify: should warn on git push --force" "got exit $exit_code"
+fi
+
+# Test: output is valid JSON when blocking
+rm -f "${CLAUDE_PLUGIN_DATA}/session-state.json"
+result=$(run_pre_push "git push origin main")
+output="${result#*|}"
+if echo "$output" | jq . >/dev/null 2>&1; then
+    log_pass "pre-push-verify: output is valid JSON"
+else
+    log_fail "pre-push-verify: output should be valid JSON" "$output"
+fi
+
+# Restore bridge file after pre-push tests
+[[ -f "$_BRIDGE_BAK_PUSH" ]] && mv "$_BRIDGE_BAK_PUSH" "$_BRIDGE"
+
+# =============================================================================
+# Bias Detector Workflow Enforcement Tests
+# =============================================================================
+echo ""
+echo "=== Bias Detector Workflow Enforcement Tests ==="
+
+run_bias_detector() {
+    local prompt="$1"
+    local output
+    output=$(jq -n --arg p "$prompt" '{"prompt":$p}' | bash "$ROOT_DIR/hooks/bias-detector.sh" 2>/dev/null)
+    local exit_code=$?
+    echo "$exit_code|$output"
+}
+
+# Test: domain modeling without design flag triggers warning (JSON output)
+rm -f "${CLAUDE_PLUGIN_DATA}/session-state.json"
+result=$(run_bias_detector "create entity User with email and name")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "0" ]] && echo "$output" | grep -qi "craftsman:design\|domain modeling"; then
+    log_pass "bias-detector: domain modeling without design warns (exit 0)"
+else
+    log_fail "bias-detector: should warn about missing /craftsman:design" "exit=$exit_code output=$(echo "$output" | head -3)"
+fi
+
+# Test: bias-detector outputs valid JSON when warning
+if echo "$output" | jq -e '.systemMessage' >/dev/null 2>&1; then
+    log_pass "bias-detector: output is valid JSON with systemMessage"
+else
+    log_fail "bias-detector: output should be JSON with systemMessage" "$output"
+fi
+
+# Test: domain modeling WITH design_used=true does NOT warn
+mkdir -p "$CLAUDE_PLUGIN_DATA"
+python3 -c "
+import json, sys
+with open(sys.argv[1], 'w') as f:
+    json.dump({'design_used': True}, f)
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null
+result=$(run_bias_detector "create entity User with email and name")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "0" ]] && ! echo "$output" | grep -qi "craftsman:design"; then
+    log_pass "bias-detector: no domain modeling warning when design_used=true"
+else
+    log_fail "bias-detector: should NOT warn when design_used=true" "output=$output"
+fi
+
+# Test: non-domain prompt produces no workflow warning
+rm -f "${CLAUDE_PLUGIN_DATA}/session-state.json"
+result=$(run_bias_detector "fix the login bug in UserController")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "0" ]] && ! echo "$output" | grep -qi "craftsman:design"; then
+    log_pass "bias-detector: no workflow warning for non-domain prompt"
+else
+    log_fail "bias-detector: non-domain prompt should not trigger workflow" "output=$output"
+fi
+
+# Test: existing bias patterns still work alongside new workflow check
+result=$(run_bias_detector "let's quickly create an entity, no time, asap")
+exit_code="${result%%|*}"
+output="${result#*|}"
+if [[ "$exit_code" == "0" ]] && echo "$output" | grep -qi "acceleration\|Acceleration"; then
+    log_pass "bias-detector: acceleration bias still detected alongside workflow check"
+else
+    log_fail "bias-detector: acceleration bias should still trigger" "exit=$exit_code"
+fi
+
+# Test: bias-detector always exits 0 (never blocks)
+result=$(run_bias_detector "create aggregate Order with line items urgently")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "bias-detector: always exits 0 (non-blocking)"
+else
+    log_fail "bias-detector: should always exit 0" "got exit $exit_code"
+fi
+
+# Test: no output when no bias detected
+result=$(run_bias_detector "add a unit test for the UserRepository")
+output="${result#*|}"
+if [[ -z "$output" ]]; then
+    log_pass "bias-detector: no output when no bias detected"
+else
+    log_fail "bias-detector: should produce no output for clean prompt" "$output"
+fi
+
+# =============================================================================
+# Hook Event Validation (only supported events)
+# =============================================================================
+echo ""
+echo "=== Hook Event Validation ==="
+
+HOOKS_FILE="$ROOT_DIR/hooks/hooks.json"
+
+# Test: hooks.json contains only supported events
+if python3 -c "
+import json
+d = json.load(open('$HOOKS_FILE'))
+supported = {'SessionStart','PreToolUse','PostToolUse','PostToolUseFailure','UserPromptSubmit','PermissionRequest','PermissionDenied','Notification','SubagentStart','SubagentStop','TaskCreated','TaskCompleted','TeammateIdle','InstructionsLoaded','ConfigChange','CwdChanged','FileChanged','WorktreeCreate','WorktreeRemove','PreCompact','PostCompact','Elicitation','ElicitationResult','Stop','StopFailure','SessionEnd'}
+actual = set(d['hooks'].keys())
+unsupported = actual - supported
+assert not unsupported, f'Unsupported events: {unsupported}'
+" 2>/dev/null; then
+    log_pass "hooks.json: all events are supported"
+else
+    log_fail "hooks.json events" "contains unsupported hook events"
+fi
+
+# Test: a matcher group carries only `matcher` and `hooks`; `if` belongs on the
+# handler. Claude Code 2.1.270 accepts exactly those two keys at matcher level
+# (`_ko = new Set(["matcher","hooks"])` in the binary) and drops any other with
+# `unknown key "if" in hooks.PreToolUse[1] ignored`, so an `if` written beside
+# `matcher` filtered nothing: pre-push-verify.sh ran on every Bash call.
+BAD_KEYS=$(python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+bad = []
+for ev, groups in d.get('hooks', {}).items():
+    for i, g in enumerate(groups):
+        for k in g:
+            if k not in ('matcher', 'hooks'):
+                bad.append('%s[%d].%s' % (ev, i, k))
+print(' '.join(bad))
+" "$HOOKS_FILE")
+if [[ -z "$BAD_KEYS" ]]; then
+    log_pass "hooks.json: every matcher group carries only matcher and hooks (if lives on the handler)"
+else
+    log_fail "hooks.json: matcher-level keys the runtime ignores" "$BAD_KEYS"
+fi
+
+# Test: hooks.json is still valid JSON after all additions
+if python3 -c "
+import json
+json.load(open('$HOOKS_FILE'))
+print('valid')
+" 2>/dev/null | grep -q "valid"; then
+    log_pass "hooks.json: valid JSON after all additions"
+else
+    log_fail "hooks.json" "invalid JSON"
+fi
+
+# =============================================================================
+# Session Metrics - Agent and Team Tracking Tests
+# =============================================================================
+echo ""
+echo "=== Session Metrics Agent/Team Tracking Tests ==="
+
+# Test: session-metrics outputs agent count from session state
+mkdir -p "$CLAUDE_PLUGIN_DATA"
+# The keys are the ones subagent-quality-gate.sh writes on SubagentStop. The
+# three this test used to write (agent_invocations, team_type, completed_tasks)
+# were written by no hook, so it asserted a summary no real session produced.
+python3 -c "
+import json, sys
+with open(sys.argv[1], 'w') as f:
+    json.dump({'subagent_count': 3,
+               'subagent_activity': [{'agent_type': 'craftsman:architect'},
+                                     {'agent_type': 'craftsman:symfony-reviewer'},
+                                     {'agent_type': 'craftsman:architect'}]}, f)
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null
+
+result=$(echo '{"session_duration_seconds": 10}' | bash "$ROOT_DIR/hooks/session-metrics.sh" 2>/dev/null)
+if echo "$result" | grep -q "3 agent invocation"; then
+    log_pass "session-metrics: includes the subagent count in summary"
+else
+    log_fail "session-metrics: should include the subagent count" "got: $result"
+fi
+
+# Test: the agent types come from the activity log, deduplicated
+if echo "$result" | grep -q "craftsman:architect" && echo "$result" | grep -q "craftsman:symfony-reviewer"; then
+    log_pass "session-metrics: names the agent types the gate recorded"
+else
+    log_fail "session-metrics: should name the agent types" "got: $result"
+fi
+
+# Test: a state with no subagent activity says nothing about agents
+python3 -c "
+import json, sys
+with open(sys.argv[1], 'w') as f:
+    json.dump({}, f)
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null
+empty_result=$(echo '{"session_duration_seconds": 10}' | bash "$ROOT_DIR/hooks/session-metrics.sh" 2>/dev/null)
+if ! echo "$empty_result" | grep -q "agent invocation"; then
+    log_pass "session-metrics: no agent line when no subagent ran"
+else
+    log_fail "session-metrics: should not claim agents when none ran" "got: $empty_result"
+fi
+
+# Test: session-metrics still exits 0
+result_exit=$(echo '{"session_duration_seconds": 10}' | bash "$ROOT_DIR/hooks/session-metrics.sh" 2>/dev/null; echo $?)
+# The echo $? trick - re-run cleanly
+if echo '{"session_duration_seconds": 0}' | bash "$ROOT_DIR/hooks/session-metrics.sh" > /dev/null 2>&1; then
+    log_pass "session-metrics: still exits 0 with empty session state"
+else
+    log_fail "session-metrics: should always exit 0" ""
+fi
+
+# =============================================================================
+# Static Analysis Structured Output Tests
+# =============================================================================
+echo ""
+echo "=== Static Analysis Structured Output Tests ==="
+
+# Source the pack-specific static analysis libs (moved from hooks/lib/static-analysis.sh in v2.4.0)
+source "$ROOT_DIR/packs/symfony/static-analysis/phpstan.sh" 2>/dev/null || true
+source "$ROOT_DIR/packs/react/static-analysis/eslint.sh" 2>/dev/null || true
+source "$ROOT_DIR/hooks/lib/static-analysis.sh"
+
+# Test: _pack_sa_phpstan_map_error maps undefined variable (moved to packs in v2.4.0)
+result=$(_pack_sa_phpstan_map_error "src/Domain/Foo.php:42:Undefined variable \$bar" 2>/dev/null)
+if [[ "$result" == "PHPSTAN002" ]]; then
+    log_pass "sa: undefined variable maps to PHPSTAN002"
+else
+    log_fail "sa: undefined variable mapping" "got $result, expected PHPSTAN002"
+fi
+
+# Test: _pack_sa_phpstan_map_error maps call to undefined to PHPSTAN003
+result=$(_pack_sa_phpstan_map_error "src/Foo.php:10:Call to undefined method Foo::bar()" 2>/dev/null)
+if [[ "$result" == "PHPSTAN003" ]]; then
+    log_pass "sa: call to undefined maps to PHPSTAN003"
+else
+    log_fail "sa: call to undefined mapping" "got $result, expected PHPSTAN003"
+fi
+
+# Test: _pack_sa_phpstan_map_error defaults to PHPSTAN001 for generic errors
+result=$(_pack_sa_phpstan_map_error "src/Foo.php:5:Something wrong" 2>/dev/null)
+if [[ "$result" == "PHPSTAN001" ]]; then
+    log_pass "sa: generic phpstan error maps to PHPSTAN001"
+else
+    log_fail "sa: generic phpstan error default" "got $result, expected PHPSTAN001"
+fi
+
+# Test: the eslint rule id mapper answers with the code that names the defect.
+# It used to be handed a line of `compact` output and asserted against
+# ^ESLINT[0-9]{3}$, which ESLINT001 satisfies as the fallback: the assertion
+# held with the whole case statement deleted, and with an adapter that had
+# never produced a line to map. A rule that maps away from the fallback is what
+# makes it an assertion. The verdicts themselves are in
+# tests/packs/test-eslint-verdict.sh.
+result=$(_pack_sa_eslint_code_for_rule "@typescript-eslint/no-explicit-any" 2>/dev/null || true)
+if [[ "$result" == "ESLINT001" ]]; then
+    log_pass "sa: no-explicit-any maps to ESLINT001"
+else
+    log_fail "sa: eslint rule id mapping" "got $result, expected ESLINT001"
+fi
+
+result=$(_pack_sa_eslint_code_for_rule "import/no-cycle" 2>/dev/null || true)
+if [[ "$result" == "ESLINT003" ]]; then
+    log_pass "sa: import/no-cycle maps to ESLINT003, not to the fallback"
+else
+    log_fail "sa: eslint rule id mapping" "got $result, expected ESLINT003"
+fi
+
+# Test: pack_sa_php not installed = graceful degradation (empty output, exit 0)
+result=$(pack_sa_php "/tmp/nonexistent.php" 2>/dev/null)
+if [[ -z "$result" ]]; then
+    log_pass "sa_phpstan: graceful degradation when not installed"
+else
+    log_fail "sa_phpstan: should return empty when not installed" "got: $result"
+fi
+
+# Test: pack_sa_typescript not installed = graceful degradation
+result=$(pack_sa_typescript "/tmp/nonexistent.ts" 2>/dev/null)
+if [[ -z "$result" ]]; then
+    log_pass "sa_eslint: graceful degradation when not installed"
+else
+    log_fail "sa_eslint: should return empty when not installed" "got: $result"
+fi
+
+# =============================================================================
+# Behavioral Integration Tests - New Hook Scripts
+# =============================================================================
+echo ""
+echo "=== Behavioral Integration Tests ==="
+
+# Setup clean session state for behavioral tests
+rm -rf "$CLAUDE_PLUGIN_DATA"
+mkdir -p "$CLAUDE_PLUGIN_DATA"
+
+# --- tool-failure-tracker.sh behavioral tests ---
+
+# Test: tool-failure-tracker writes failure to session-state.json
+echo '{"tool_name":"Write","error":"Permission denied: /etc/hosts"}' | bash "$ROOT_DIR/hooks/tool-failure-tracker.sh" 2>/dev/null
+if python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    state = json.load(f)
+failures = state.get('tool_failures', [])
+assert len(failures) == 1, f'Expected 1 failure, got {len(failures)}'
+assert failures[0]['tool'] == 'Write'
+assert 'Permission denied' in failures[0]['error']
+assert 'timestamp' in failures[0]
+assert state.get('tool_failure_count') == 1
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null; then
+    log_pass "tool-failure-tracker: writes failure with tool, error, timestamp"
+else
+    log_fail "tool-failure-tracker behavioral" "session-state.json not written correctly"
+fi
+
+# Test: tool-failure-tracker increments count on subsequent failures
+echo '{"tool_name":"Bash","error":"Command failed"}' | bash "$ROOT_DIR/hooks/tool-failure-tracker.sh" 2>/dev/null
+if python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    state = json.load(f)
+assert state.get('tool_failure_count') == 2, f'Expected 2, got {state.get(\"tool_failure_count\")}'
+assert len(state.get('tool_failures', [])) == 2
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null; then
+    log_pass "tool-failure-tracker: increments count on subsequent failures"
+else
+    log_fail "tool-failure-tracker count" "count not incremented"
+fi
+
+# Test: tool-failure-tracker truncates long errors at 200 chars
+LONG_ERROR=$(python3 -c "print('X' * 500)")
+jq -n --arg e "$LONG_ERROR" '{"tool_name":"Edit","error":$e}' | bash "$ROOT_DIR/hooks/tool-failure-tracker.sh" 2>/dev/null
+if python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    state = json.load(f)
+last = state['tool_failures'][-1]
+assert len(last['error']) <= 200, f'Error too long: {len(last[\"error\"])}'
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null; then
+    log_pass "tool-failure-tracker: truncates errors at 200 chars"
+else
+    log_fail "tool-failure-tracker truncation" "error not truncated"
+fi
+
+# Test: tool-failure-tracker caps at 50 entries
+rm -f "${CLAUDE_PLUGIN_DATA}/session-state.json"
+for i in $(seq 1 55); do
+    echo "{\"tool_name\":\"Write\",\"error\":\"err$i\"}" | bash "$ROOT_DIR/hooks/tool-failure-tracker.sh" 2>/dev/null
+done
+if python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    state = json.load(f)
+assert len(state.get('tool_failures', [])) == 50, f'Expected 50, got {len(state.get(\"tool_failures\", []))}'
+assert state['tool_failures'][0]['error'] == 'err6', f'Expected err6 (oldest kept), got {state[\"tool_failures\"][0][\"error\"]}'
+assert state.get('tool_failure_count') == 55
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null; then
+    log_pass "tool-failure-tracker: caps at 50 entries, count tracks all 55"
+else
+    log_fail "tool-failure-tracker cap" "50-entry cap not working"
+fi
+
+# Test: tool-failure-tracker exits 0 with empty input
+echo '' | bash "$ROOT_DIR/hooks/tool-failure-tracker.sh" 2>/dev/null
+if [[ $? -eq 0 ]]; then
+    log_pass "tool-failure-tracker: exits 0 with empty input"
+else
+    log_fail "tool-failure-tracker empty" "non-zero exit"
+fi
+
+# --- subagent-quality-gate.sh behavioral tests ---
+
+# Reset session state
+rm -f "${CLAUDE_PLUGIN_DATA}/session-state.json"
+
+# Test: subagent-quality-gate writes agent activity
+echo '{"agent_type":"architect"}' | bash "$ROOT_DIR/hooks/subagent-quality-gate.sh" 2>/dev/null
+if python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    state = json.load(f)
+agents = state.get('subagent_activity', [])
+assert len(agents) == 1, f'Expected 1 agent entry, got {len(agents)}'
+assert agents[0]['agent_type'] == 'architect'
+assert 'completed_at' in agents[0]
+assert state.get('subagent_count') == 1
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null; then
+    log_pass "subagent-quality-gate: writes agent activity with type and timestamp"
+else
+    log_fail "subagent-quality-gate behavioral" "session-state.json not written correctly"
+fi
+
+# Test: subagent-quality-gate increments on multiple agents
+echo '{"agent_type":"security-pentester"}' | bash "$ROOT_DIR/hooks/subagent-quality-gate.sh" 2>/dev/null
+echo '{"agent_type":"doc-writer"}' | bash "$ROOT_DIR/hooks/subagent-quality-gate.sh" 2>/dev/null
+if python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    state = json.load(f)
+assert state.get('subagent_count') == 3, f'Expected 3, got {state.get(\"subagent_count\")}'
+types = [a['agent_type'] for a in state.get('subagent_activity', [])]
+assert 'security-pentester' in types
+assert 'doc-writer' in types
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null; then
+    log_pass "subagent-quality-gate: tracks multiple agent types"
+else
+    log_fail "subagent-quality-gate multi" "count or types wrong"
+fi
+
+# Test: subagent-quality-gate caps at 100 entries
+rm -f "${CLAUDE_PLUGIN_DATA}/session-state.json"
+for i in $(seq 1 105); do
+    echo "{\"agent_type\":\"agent$i\"}" | bash "$ROOT_DIR/hooks/subagent-quality-gate.sh" 2>/dev/null
+done
+if python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    state = json.load(f)
+assert len(state.get('subagent_activity', [])) == 100, f'Expected 100, got {len(state.get(\"subagent_activity\", []))}'
+assert state.get('subagent_count') == 105
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null; then
+    log_pass "subagent-quality-gate: caps at 100 entries, count tracks all 105"
+else
+    log_fail "subagent-quality-gate cap" "100-entry cap not working"
+fi
+
+# Test: subagent-quality-gate exits 0 with empty input
+echo '' | bash "$ROOT_DIR/hooks/subagent-quality-gate.sh" 2>/dev/null
+if [[ $? -eq 0 ]]; then
+    log_pass "subagent-quality-gate: exits 0 with empty input"
+else
+    log_fail "subagent-quality-gate empty" "non-zero exit"
+fi
+
+# --- pre-compact-save.sh behavioral tests ---
+
+# Setup: create session state with violations and patterns
+python3 -c "
+import json, sys
+state = {
+    'blocked_violations': {
+        'src/Domain/User.php': ['PHP001'],
+        'src/App/Service.php': ['PHP003', 'PHP005']
+    },
+    'patterns': {'missing_final': 3},
+    'tool_failure_count': 2,
+    'subagent_count': 1
+}
+with open(sys.argv[1], 'w') as f:
+    json.dump(state, f)
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null
+
+# Test: pre-compact-save outputs systemMessage with violation summary
+result=$(echo '{}' | bash "$ROOT_DIR/hooks/pre-compact-save.sh" 2>/dev/null)
+if echo "$result" | jq -e '.systemMessage' >/dev/null 2>&1; then
+    log_pass "pre-compact-save: outputs valid JSON with systemMessage"
+else
+    log_fail "pre-compact-save output" "no systemMessage in output: $result"
+fi
+
+# Test: pre-compact-save preserves compact_count in state
+if python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    state = json.load(f)
+assert state.get('compact_count') == 1, f'Expected compact_count=1, got {state.get(\"compact_count\")}'
+assert 'last_compact' in state, 'Missing last_compact timestamp'
+assert 'pre_compact_summary' in state, 'Missing pre_compact_summary'
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null; then
+    log_pass "pre-compact-save: writes compact_count, last_compact, pre_compact_summary"
+else
+    log_fail "pre-compact-save state" "missing compaction metadata"
+fi
+
+# Test: pre-compact-save grammar - singular forms
+python3 -c "
+import json, sys
+state = {
+    'blocked_violations': {'src/Foo.php': ['PHP001']},
+    'patterns': {},
+    'tool_failure_count': 1,
+    'subagent_count': 0
+}
+with open(sys.argv[1], 'w') as f:
+    json.dump(state, f)
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null
+result=$(echo '{}' | bash "$ROOT_DIR/hooks/pre-compact-save.sh" 2>/dev/null)
+if echo "$result" | grep -q "1 active violation across 1 file" && echo "$result" | grep -q "1 tool failure"; then
+    log_pass "pre-compact-save: correct singular grammar (1 file, 1 violation, 1 failure)"
+else
+    log_fail "pre-compact-save grammar" "singular forms incorrect: $result"
+fi
+
+# Test: pre-compact-save exits 0 with empty session state
+rm -f "${CLAUDE_PLUGIN_DATA}/session-state.json"
+echo '{}' | bash "$ROOT_DIR/hooks/pre-compact-save.sh" 2>/dev/null
+if [[ $? -eq 0 ]]; then
+    log_pass "pre-compact-save: exits 0 with no session state"
+else
+    log_fail "pre-compact-save empty" "non-zero exit"
+fi
+
+# --- post-compact-verify.sh behavioral tests ---
+
+# Setup: simulate state after pre-compact-save
+python3 -c "
+import json, sys
+state = {
+    'compact_count': 1,
+    'pre_compact_summary': '3 active violations across 2 files | 1 tool failure this session',
+    'blocked_violations': {
+        'src/Domain/User.php': ['PHP001'],
+        'src/App/Service.php': ['PHP003', 'PHP005']
+    },
+    'tool_failure_count': 1
+}
+with open(sys.argv[1], 'w') as f:
+    json.dump(state, f)
+" "${CLAUDE_PLUGIN_DATA}/session-state.json" 2>/dev/null
+
+# Test: post-compact-verify outputs recovery message
+result=$(echo '{}' | bash "$ROOT_DIR/hooks/post-compact-verify.sh" 2>/dev/null)
+if echo "$result" | jq -e '.systemMessage' >/dev/null 2>&1 && echo "$result" | grep -q "STATE OK"; then
+    log_pass "post-compact-verify: outputs systemMessage with STATE OK"
+else
+    log_fail "post-compact-verify output" "missing systemMessage or STATE OK: $result"
+fi
+
+# Test: post-compact-verify reports compact count
+if echo "$result" | grep -q "Compaction #1"; then
+    log_pass "post-compact-verify: includes compaction count"
+else
+    log_fail "post-compact-verify count" "missing compaction count: $result"
+fi
+
+# Test: post-compact-verify exits 0 with no session state
+rm -f "${CLAUDE_PLUGIN_DATA}/session-state.json"
+echo '{}' | bash "$ROOT_DIR/hooks/post-compact-verify.sh" 2>/dev/null
+if [[ $? -eq 0 ]]; then
+    log_pass "post-compact-verify: exits 0 with no session state"
+else
+    log_fail "post-compact-verify empty" "non-zero exit"
+fi
+
+# --- craftsman-validate sanitization test ---
+
+# Test: craftsman-validate uses jq (not string interpolation)
+if grep -q 'jq -n --arg' "$ROOT_DIR/bin/craftsman-validate"; then
+    log_pass "craftsman-validate: uses jq --arg for safe input"
+else
+    log_fail "craftsman-validate sanitization" "still using string interpolation"
+fi
+
+# =============================================================================
+# Cleanup & Summary
+# =============================================================================
+cleanup_test_env
+test_summary

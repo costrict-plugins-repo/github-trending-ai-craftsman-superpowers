@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# =============================================================================
+# FileChanged Monitoring Hook for Claude Code
+# Lightweight Level 1 regex validation on file changes.
+# Complements Write/Edit hooks - covers external changes (IDE, git).
+#
+# FileChanged is a supported Claude Code hook type (verified 2026-04-04).
+# Wired in hooks.json on the common source roots (src/, app/, lib/, libs/,
+# packages/, apps/) and async: true. A FileChanged matcher lists literal
+# filenames or directories with a trailing slash; the glob it carried for four
+# releases ("*.php|*.ts|*.tsx") is not a form the event supports, so the hook
+# never fired for anything. The language is decided below, by the registry.
+#
+# TRIGGERS: FileChanged (async)
+# EXIT CODES: 0 always (non-blocking, monitoring only)
+# =============================================================================
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/hook-profile.sh"
+hook_profile_should_run "file-changed" "standard,strict" || exit 0
+source "${SCRIPT_DIR}/lib/session-files.sh"
+INPUT=$(cat)
+session_files_bind "$INPUT"
+source "${SCRIPT_DIR}/lib/config.sh"
+source "${SCRIPT_DIR}/lib/metrics-db.sh"
+source "${SCRIPT_DIR}/lib/pack-loader.sh"
+
+# Read file path from stdin JSON
+FILE_PATH=$(echo "$INPUT" | jq -r '.file_path // empty' 2>/dev/null)
+
+# Exit silently if no file path or file doesn't exist
+[[ -z "$FILE_PATH" || ! -f "$FILE_PATH" ]] && exit 0
+
+# Whether this is a source file is the registry's answer, and the registry only
+# exists after pack_loader_init. The extension guard therefore moved below that
+# call: keeping it here is what made this hook blind to every language the
+# engine had not been taught about.
+metrics_init 2>/dev/null || true
+
+FILE_PATTERN=$(metrics_file_pattern "$FILE_PATH")
+ISSUES=""
+ISSUE_COUNT=0
+
+add_issue() {
+    local rule="$1"
+    local message="$2"
+    ISSUES="${ISSUES}${rule}: ${message}\n"
+    ((ISSUE_COUNT++)) || true
+    metrics_record_violation "$rule" "$FILE_PATTERN" "info" 0 0 2>/dev/null || true
+}
+
+# Provide add_violation/add_warning as aliases for pack validators
+# In file-changed context, all violations are non-blocking issues
+add_violation() { add_issue "$1" "$2"; }
+add_warning() { add_issue "$1" "$2"; }
+line_has_ignore() { return 1; }
+
+# Initialize pack loader (sources validators from compatible packs)
+pack_loader_init
+
+# Not a source file for any loaded pack: nothing to report, and saying so by
+# exiting is cheaper than dispatching to nothing.
+[[ -z "$(lang_for_file "$FILE_PATH")" ]] && exit 0
+
+# Level 1: Pack validators
+pack_dispatch_file "$FILE_PATH"
+
+# Output only if issues found
+if [[ $ISSUE_COUNT -gt 0 ]]; then
+    rel_path="${FILE_PATH#"$PWD"/}"
+    jq -n --arg fp "$rel_path" --arg issues "$(echo -e "$ISSUES")" --arg count "$ISSUE_COUNT" '{
+        systemMessage: ("FileChanged: " + $fp + " - " + $count + " issue(s) detected:\n" + $issues + "Not blocking - use Write/Edit for enforcement.")
+    }'
+fi
+
+exit 0

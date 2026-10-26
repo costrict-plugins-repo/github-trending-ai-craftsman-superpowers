@@ -1,0 +1,105 @@
+// =============================================================================
+// Craftsman Quality Gate - Jenkins Pipeline template
+//
+// Usage:
+//   1. Copy this file as 'Jenkinsfile' or load it via shared library
+//   2. Adjust agent/docker image as needed
+//
+// The jenkins adapter writes craftsman-checkstyle.xml, which the Warnings Next
+// Generation plugin reads natively: each finding lands on its file and line in
+// the Issues view and in the diff of a change request, with the rule id as its
+// category. It also writes craftsman-comment.md and prints the findings to the
+// console, so a build without the plugin loses nothing.
+//
+// Requires: Warnings Next Generation (warnings-ng). Without it, drop the
+// recordIssues step below; the gate still fails the build on violations.
+// =============================================================================
+
+pipeline {
+    agent {
+        docker {
+            image 'python:3.12-slim'
+        }
+    }
+
+    stages {
+        stage('Setup') {
+            steps {
+                script {
+                    if (fileExists('composer.json')) {
+                        sh 'composer install --no-interaction --prefer-dist'
+                    }
+                    if (fileExists('package.json')) {
+                        sh 'npm ci'
+                    }
+                }
+            }
+        }
+
+        stage('Craftsman Quality Gate') {
+            steps {
+                // Jenkins reuses a workspace between builds. A report left by
+                // an earlier one would be published as if it belonged to this
+                // build, which is worse than no report at all.
+                sh 'rm -f craftsman-checkstyle.xml craftsman-comment.md'
+                sh 'chmod +x ci/craftsman-ci.sh'
+                // Runs through the generic adapter, so this stage gets the same
+                // verdict as every other provider: annotations on stdout,
+                // craftsman-comment.md written, and the fail-closed exit code
+                // (2 = violations, 1 = warnings only, and an unreadable or
+                // empty scan is a failure, not a pass). Parsing the JSON here
+                // instead, as this template used to, bypassed all of that and
+                // never produced the comment file it archives below.
+                script {
+                    int status = sh(
+                        // A pull request (CHANGE_TARGET is set on multibranch PR
+                        // builds) validates only the files it changes; a branch
+                        // build still scans everything. The fetch uses the refspec
+                        // form on purpose: a GitHub Branch Source PR job clones with
+                        // a refspec covering pull refs only, and a bare
+                        // `git fetch origin develop` then lands in FETCH_HEAD
+                        // without creating origin/develop, which is the ref the
+                        // resolver looks for.
+                        script: 'if [ -n "${CHANGE_TARGET:-}" ]; then git fetch origin "+refs/heads/$CHANGE_TARGET:refs/remotes/origin/$CHANGE_TARGET"; fi; bash ci/craftsman-ci.sh ci --provider jenkins ${CHANGE_TARGET:+--changed-only}',
+                        returnStatus: true
+                    )
+
+                    // Published before the verdict is applied. `error` aborts
+                    // the stage, so recording the issues afterwards would lose
+                    // them on exactly the builds that have some.
+                    if (fileExists('craftsman-checkstyle.xml')) {
+                        recordIssues(
+                            tools: [checkStyle(
+                                pattern: 'craftsman-checkstyle.xml',
+                                name: 'Craftsman'
+                            )],
+                            // The gate below owns the verdict. Setting a
+                            // quality gate here as well would give the build
+                            // two masters that can disagree.
+                            enabledForFailure: true,
+                            skipPublishingChecks: false
+                        )
+                    }
+
+                    if (status == 2) {
+                        error 'Craftsman quality gate failed. See the Craftsman issues on this build.'
+                    }
+                    if (status == 1) {
+                        unstable 'Craftsman reported warnings.'
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // Not craftsman-report.json: `ci` mode writes it to a temporary
+            // file and removes it, so the workspace never holds one.
+            archiveArtifacts artifacts: 'craftsman-comment.md,craftsman-checkstyle.xml', allowEmptyArchive: true
+        }
+        failure {
+            echo 'Craftsman Quality Gate failed - see the Craftsman issues on this build, or craftsman-comment.md'
+        }
+    }
+}

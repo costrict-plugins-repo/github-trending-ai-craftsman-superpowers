@@ -1,0 +1,66 @@
+name: bash
+version: "1.0.0"
+description: "Bash/Shell craftsman pack - safety, naming, function discipline, shellcheck patterns"
+compatibility:
+  core: ">=3.1.0"
+  stack: ["*"]
+
+languages:
+  - id: bash
+    extensions: [sh, bash]
+    # literal_syntax: which comment and string syntax the structural ratchet
+    # blanks before measuring, so a control keyword inside a string or a
+    # comment is not a decision point. A closed name the engine knows, never a
+    # list of characters: `quotes: ["'"]` declared on Rust would reproduce the
+    # lifetime bug and nothing would refuse it, while a name can be refused at
+    # compile time. See KNOWN_LITERAL_SYNTAXES in hooks/lib/lang_registry.py.
+    literal_syntax: hash
+    entry_markers: []
+    protected_configs: [".shellcheckrc"]
+    validators: ["hooks/bash-validator.sh"]
+    test_commands: ["bats", "shellspec"]
+    # No metrics_dialect: see packs/python/pack.yml. Shell functions are
+    # brace-delimited but its control flow is not (if/fi, do/done), so the
+    # c-like extractor would under-report nesting rather than fail visibly.
+
+rules:
+  # Rules this pack owns: the wording and the default severity that the
+  # exported doctrine and the rules engine both read from here.
+  owned:
+    - id: SH001
+      group: Shell
+      text: "set -u in every executable script"
+      default_severity: warn
+    - id: SH002
+      group: Shell
+      text: "a function past 30 lines is extracted"
+      default_severity: block
+    - id: SH003
+      group: Shell
+      text: "no single-character variable names outside loop conventions"
+      default_severity: warn
+    - id: SH004
+      group: Shell
+      text: "no eval"
+      default_severity: block
+    - id: SH005
+      group: Shell
+      text: "quote every variable used in a file operation"
+      default_severity: warn
+    - id: WARN-SH001
+      group: Advisory
+      text: "a function assigns without declaring local"
+      default_severity: warn
+  builtin: ["SH001", "SH002", "SH003", "SH004", "SH005", "WARN-SH001"]
+
+hooks:
+  validators: ["hooks/bash-validator.sh"]
+
+commands:
+  scaffold_types: []
+
+agents: []
+
+knowledge: ["knowledge/"]
+
+templates: []

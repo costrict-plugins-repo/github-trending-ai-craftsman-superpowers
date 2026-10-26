@@ -1,0 +1,850 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Rules Engine - 3-level config inheritance with custom rules
+# Resolves rule severity from: global → project → directory overrides
+#
+# Config format (.craft-config.yml):
+#   version: "2.1"
+#   strictness: strict|moderate|relaxed
+#   rules:
+#     PHP001: block           # Short form
+#     CUSTOM001:              # Long form (custom rule)
+#       pattern: "dd\\("
+#       message: "No dd()"
+#       severity: block
+#       languages: [php]
+#
+# Directory override (.craft-rules.yml - rules section only):
+#   rules:
+#     PHP002: ignore
+#
+# Usage:
+#   source "hooks/lib/rules-engine.sh"
+#   rules_init "$project_dir" ["$global_dir"]
+#   rules_severity "PHP001"                            # block|warn|ignore
+#   rules_severity_for_file "src/Infra/Repo.php" "PHP001"
+#   rules_custom_list "php"                            # CUSTOM001\nCUSTOM002
+#   rules_pattern "CUSTOM001"                          # regex pattern
+#   rules_message "CUSTOM001"                          # human message
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Storage: file-based key-value store (bash 3.2 compatible)
+# Each "associative array" is a directory of files: key → content
+# ---------------------------------------------------------------------------
+_RULES_STORE=""
+_RULES_PROJECT_DIR=""
+_RULES_STRICTNESS="strict"
+_RULES_STRICTNESS_IS_DEFAULT=true
+
+# A rule's default severity belongs to whoever owns the rule, so severity
+# resolution needs the rule registry whether or not the caller loaded the packs.
+# shellcheck source=./rule-registry.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rule-registry.sh"
+# The rule baseline is part of severity resolution, so the engine owns it and
+# every front-end that sources the engine gets it. Sourcing it here rather than
+# in each front-end is what stopped the hook and CI disagreeing on a file.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rule-baseline.sh"
+
+_rules_store_dir() {
+    local namespace="$1"
+    echo "$_RULES_STORE/$namespace"
+}
+
+# Rule ids reach this as filenames, and they come from YAML keys in a
+# repository-controlled config. A key containing a path separator would write
+# outside the store; keys are therefore structurally constrained here as well
+# as validated at the point of entry (defense in depth: this also covers
+# callers added later).
+# A rule id becomes a filename and a store key. It comes from a YAML key in a
+# repository-controlled config, so it is constrained to an identifier charset
+# before it reaches any sink.
+_rules_id_is_safe() {
+    [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+_rules_key_is_safe() {
+    local key="$1"
+    [[ -n "$key" ]] || return 1
+    [[ "$key" != */* ]] || return 1
+    [[ "$key" != *..* ]] || return 1
+    return 0
+}
+
+_rules_set() {
+    local namespace="$1" key="$2" value="$3"
+    _rules_key_is_safe "$key" || {
+        echo "[rules-engine] rejected unsafe rule key: ${key}" >&2
+        return 0
+    }
+    local dir="$_RULES_STORE/$namespace"
+    [[ -d "$dir" ]] || mkdir -p "$dir"
+    printf '%s' "$value" > "$dir/$key"
+}
+
+_rules_get() {
+    local namespace="$1" key="$2"
+    local file
+    file="$(_rules_store_dir "$namespace")/$key"
+    if [[ -f "$file" ]]; then
+        cat "$file"
+    fi
+}
+
+_rules_keys() {
+    local namespace="$1"
+    local dir
+    dir="$(_rules_store_dir "$namespace")"
+    if [[ -d "$dir" ]]; then
+        ls "$dir" 2>/dev/null
+    fi
+}
+
+_rules_has() {
+    local namespace="$1" key="$2"
+    [[ -f "$(_rules_store_dir "$namespace")/$key" ]]
+}
+
+# ---------------------------------------------------------------------------
+# Reset all state (for tests)
+# ---------------------------------------------------------------------------
+_rules_reset() {
+    if [[ -n "$_RULES_STORE" ]] && [[ -d "$_RULES_STORE" ]]; then
+        rm -rf "$_RULES_STORE"
+    fi
+    _RULES_STORE=""
+    _RULES_PROJECT_DIR=""
+    _RULES_STRICTNESS="strict"
+    _RULES_STRICTNESS_IS_DEFAULT=true
+}
+
+_rules_reset_dir_cache() {
+    local dir
+    dir="$(_rules_store_dir "dir_cache")"
+    if [[ -d "$dir" ]]; then
+        rm -rf "$dir"
+    fi
+    dir="$(_rules_store_dir "dir_parsed")"
+    if [[ -d "$dir" ]]; then
+        rm -rf "$dir"
+    fi
+}
+
+# A hook runs wherever its host puts it, and /tmp is not always writable
+# there: a Codex session qualifying this plugin under an OS sandbox got
+# `mktemp: mkdtemp failed on /tmp/craftsman-rules-XXXXXX: Operation not
+# permitted`, and that message became the refusal the model read
+# (2026-09-20). TMPDIR first, then the plugin's own data directory, then
+# /tmp; a store that cannot be made at all is reported, never silently empty.
+_rules_ensure_store() {
+    local base
+    [[ -n "$_RULES_STORE" ]] && return 0
+    for base in "${TMPDIR:-}" "$(session_cache_dir)" /tmp; do
+        [[ -n "$base" && -d "$base" && -w "$base" ]] || continue
+        _RULES_STORE=$(mktemp -d "${base%/}/craftsman-rules-XXXXXX" 2>/dev/null) && return 0
+    done
+    echo "craftsman: no writable directory for the rules store (tried TMPDIR, the plugin data directory and /tmp)" >&2
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Python YAML parser path (co-located with this script)
+# ---------------------------------------------------------------------------
+_RULES_YAML_PARSER=""
+_rules_yaml_parser_path() {
+    if [[ -z "$_RULES_YAML_PARSER" ]]; then
+        _RULES_YAML_PARSER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/yaml-parser.py"
+    fi
+    echo "$_RULES_YAML_PARSER"
+}
+
+# ---------------------------------------------------------------------------
+# Parse .craft-config.yml via Python yaml-parser.py → populate stores from JSON
+# ---------------------------------------------------------------------------
+# Every field of the config in one jq: five per rule made a three-rule config
+# cost fifteen processes on every hook (CR-278). NUL-separated, so a pattern or
+# a message may hold any character. Per rule: id, severity, pattern, message,
+# whether `languages` is an array, and the array joined with commas. A rule
+# that is not a mapping yields empty fields, as the per-field reads did.
+_RULES_CONFIG_JQ='def s: if . == null or . == false then "" elif type == "string" then . else tojson end;
+(.strictness | s), "\u0000",
+((.rules // {}) as $r | ($r | if type == "object" then keys[] else empty end) as $k | $r[$k] as $v
+ | ($v | type == "object") as $o
+ | $k, "\u0000",
+   (if $o then ($v.severity | s) else "" end), "\u0000",
+   (if $o then ($v.pattern | s) else "" end), "\u0000",
+   (if $o then ($v.message | s) else "" end), "\u0000",
+   (if $o and ($v.languages | type) == "array" then "array" else "none" end), "\u0000",
+   (if $o and ($v.languages | type) == "array" then ($v.languages | map(s) | join(",")) else "" end), "\u0000")'
+
+# Reads one rule's six fields into the caller's variables of those names.
+_rules_read_record() {
+    local _rrr_field
+    for _rrr_field in rule_id severity pattern message languages_mode languages; do
+        IFS= read -r -d '' "$_rrr_field" || return 1
+    done
+}
+
+_rules_apply_parsed_config() {
+    local json_output="$1"
+    local source_label="$2"
+    local val rule_id severity pattern message languages_mode languages
+    {
+        IFS= read -r -d '' val || return 0
+        _rules_apply_strictness "$val" "$source_label"
+        while _rules_read_record; do
+            _rules_id_is_safe "$rule_id" || continue
+            # Where a severity came from is stored beside it: a global line is
+            # a preference across the machine, a project line a statement about
+            # this repository, and only the second may outrank a baseline.
+            if [[ -n "$severity" ]]; then
+                _rules_set "severity" "$rule_id" "$severity"
+                _rules_set "severity_source" "$rule_id" "$source_label"
+            fi
+            [[ -n "$pattern" ]] && _rules_set "pattern" "$rule_id" "$pattern"
+            [[ -n "$message" ]] && _rules_set "message" "$rule_id" "$message"
+            # An EMPTY array says "no language", which is not "undeclared".
+            [[ "$languages_mode" == "array" ]] && _rules_set "languages" "$rule_id" "$languages"
+        done
+    } < <(printf '%s' "$json_output" | jq -j "$_RULES_CONFIG_JQ" 2>/dev/null)
+    return 0
+}
+
+_rules_apply_strictness() {
+    local val="$1" source_label="$2"
+    if [[ -n "$val" ]]; then
+        if [[ "${_RULES_STRICTNESS_IS_DEFAULT:-false}" == true ]] \
+            || [[ "$source_label" == "project" ]] \
+            || [[ -z "$_RULES_STRICTNESS" ]] \
+            || [[ "$_RULES_STRICTNESS" == "strict" && "$source_label" == "global" ]]; then
+            _RULES_STRICTNESS="$val"
+            _RULES_STRICTNESS_IS_DEFAULT=false
+        fi
+    fi
+}
+
+_rules_parse_config() {
+    local file="$1"
+    local source_label="$2"
+
+    [[ ! -f "$file" ]] && return 0
+
+    local parser_path
+    parser_path="$(_rules_yaml_parser_path)"
+    local json_output
+    # A parser failure is not an empty config. Built-in rules fall back to
+    # strict, but every custom rule declared in .craft-config.yml simply
+    # ceased to exist, silently, and CI suppressed the stderr that would have
+    # said so. Announce it: a rule the team wrote and that never fires is
+    # worse than no rule, because they believe it is running.
+    json_output=$(python3 "$parser_path" "$file" "config") || {
+        echo "craftsman: could not parse $file, its custom rules will not be enforced" >&2
+        json_output="{}"
+    }
+
+    if [[ -z "$json_output" ]] || [[ "$json_output" == "{}" ]]; then
+        return 0
+    fi
+
+    _rules_apply_parsed_config "$json_output" "$source_label"
+}
+
+# ---------------------------------------------------------------------------
+# Parse directory-level .craft-rules.yml via Python yaml-parser.py
+# ---------------------------------------------------------------------------
+_rules_parse_dir_config() {
+    local file="$1"
+    local dir_key="$2"  # sanitized dir path for cache key
+
+    [[ ! -f "$file" ]] && return 0
+
+    local parser_path
+    parser_path="$(_rules_yaml_parser_path)"
+    local json_output
+    json_output=$(python3 "$parser_path" "$file" "rules") || {
+        echo "craftsman: could not parse rules from $file, they will not be enforced" >&2
+        json_output="{}"
+    }
+
+    if [[ -z "$json_output" ]] || [[ "$json_output" == "{}" ]]; then
+        return 0
+    fi
+
+    local rule_ids
+    rule_ids=$(printf '%s' "$json_output" | jq -r '.rules // {} | keys[]' 2>/dev/null)
+
+    _rules_cache_dir_rules "$json_output" "$dir_key" "$rule_ids"
+}
+
+_rules_cache_dir_rules() {
+    local json_output="$1" dir_key="$2" rule_ids="$3"
+    local rule_id rule_val
+    for rule_id in $rule_ids; do
+        _rules_id_is_safe "$rule_id" || continue
+        rule_val=$(printf '%s' "$json_output" | jq -r ".rules[\"$rule_id\"]" 2>/dev/null)
+        if [[ "$rule_val" =~ ^(block|warn|ignore)$ ]]; then
+            _rules_set "dir_cache" "${dir_key}:${rule_id}" "$rule_val"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Validate custom rules: pattern, severity, languages
+# Invalid rules get severity forced to "ignore" + stderr warning
+# ---------------------------------------------------------------------------
+_rules_validate_pattern() {
+    local rule_id="$1"
+    local pattern
+    pattern=$(_rules_get "pattern" "$rule_id")
+    if [[ -z "$pattern" ]]; then
+        echo "[rules-engine] WARNING: Rule $rule_id has no pattern, setting to ignore" >&2
+        return 1
+    fi
+    local grep_ret=0
+    # -e is required: the pattern comes from the audited repository's own
+    # .craft-config.yml, and without it a leading dash is parsed as an option.
+    # `--file=/dev/zero` hangs the hook on every Write/Edit; `--file=/etc/passwd`
+    # makes grep read an arbitrary local file as its pattern source.
+    echo "test" | grep -E -e "$pattern" >/dev/null 2>&1 || grep_ret=$?
+    if [[ $grep_ret -eq 2 ]]; then
+        echo "[rules-engine] WARNING: Rule $rule_id has invalid regex pattern '$pattern', setting to ignore" >&2
+        return 1
+    fi
+    return 0
+}
+
+_rules_match_custom_rule() {
+    local rule_id="$1"
+    local valid=1
+
+    _rules_validate_pattern "$rule_id" || valid=0
+
+    local severity
+    severity=$(_rules_get "severity" "$rule_id")
+    if [[ -n "$severity" ]] && [[ ! "$severity" =~ ^(block|warn|ignore)$ ]]; then
+        valid=0
+        echo "[rules-engine] WARNING: Rule $rule_id has invalid severity '$severity', setting to ignore" >&2
+    fi
+
+    local languages
+    languages=$(_rules_get "languages" "$rule_id")
+    if [[ -z "$languages" ]]; then
+        valid=0
+        echo "[rules-engine] WARNING: Rule $rule_id has no languages, setting to ignore" >&2
+    fi
+
+    echo "$valid"
+}
+
+_rules_validate_custom() {
+    local rule_id="$1"
+    local valid
+    valid=$(_rules_match_custom_rule "$rule_id")
+
+    if [[ $valid -eq 0 ]]; then
+        _rules_set "severity" "$rule_id" "ignore"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Compute default severity for a rule based on strictness
+# ---------------------------------------------------------------------------
+# A rule's advisory default is declared ONCE, in the manifest that owns it:
+# `default_severity: warn` under `rules.owned` in rules/core.yml or in the
+# pack's pack.yml, with a `decision:` line when the choice was adjudicated on
+# measured data. There is no list here.
+#
+# There used to be one, mirrored a second time in ci/craftsman-ci.sh, and both
+# were unreachable for every rule a manifest declares: `_rules_declared_severity`
+# reads the registry first, and the registry is compiled from those manifests
+# whenever python3 exists. Without python3 no language is registered, no
+# validator dispatches and no rule fires, so the lists answered for nobody and
+# were maintained by hand from the same information the manifests carry (#37).
+#
+# The one convention kept is the name: a WARN- prefix states the intent, and a
+# pack may emit one before its manifest declares it. Anything else nobody
+# declared blocks under strict, which is the visible direction: a rule that
+# blocks because its owner forgot to declare it gets declared the same day.
+_rules_is_advisory() {
+    [[ "$1" == WARN* ]]
+}
+
+# What a rule defaults to when no configuration names it.
+#
+# The owning pack states the intent (rules/core.yml or its own manifest), and
+# strictness then applies on top: `relaxed` still relaxes everything, `moderate`
+# still keeps only boundary rules blocking. Returning the declared value
+# directly made a project's `strictness: relaxed` a no-op, which is a setting
+# silently ignored rather than a visible failure.
+_rules_declared_severity() {
+    local rule_id="$1" declared=""
+    if type rule_default_severity &>/dev/null 2>&1; then
+        declared=$(rule_default_severity "$rule_id" 2>/dev/null)
+    fi
+    if [[ -z "$declared" ]]; then
+        # No declaration: a rule a validator emits without owning it.
+        _rules_is_advisory "$rule_id" && declared="warn" || declared="block"
+    fi
+    printf '%s' "$declared"
+}
+
+_rules_default_severity() {
+    local rule_id="$1" declared
+    declared=$(_rules_declared_severity "$rule_id")
+    [[ "$declared" == "ignore" ]] && { echo "ignore"; return 0; }
+    [[ "$declared" == "warn" ]] && { echo "warn"; return 0; }
+
+    # `moderate` relaxes design and style, never a boundary and never security.
+    #
+    # SEC* was missing from this list, and it mattered the day an existing
+    # project started defaulting to `moderate`: a hardcoded secret silently
+    # became advisory on every repository with history. A gate that stops
+    # refusing a live credential because someone dialled the strictness down is
+    # wrong on its own terms, whatever the default is. `relaxed` is the setting
+    # for "warn me about everything, block nothing", and it is chosen
+    # explicitly.
+    case "$_RULES_STRICTNESS" in
+        relaxed)  echo "warn" ;;
+        moderate) case "$rule_id" in LAYER*|SEC*) echo "$declared" ;; *) echo "warn" ;; esac ;;
+        *)        echo "$declared" ;;
+    esac
+}
+
+# ===========================================================================
+# PUBLIC API
+# ===========================================================================
+
+# The global layer every front-end passes to rules_init: one answer, see
+# config_global_dir. Defined here too because the pipeline may source this
+# file without config.sh.
+rules_global_dir() {
+    if type config_global_dir >/dev/null 2>&1; then config_global_dir; else printf '%s' "${CRAFTSMAN_GLOBAL_CONFIG_DIR-${HOME}/.claude}"; fi
+}
+
+# ---------------------------------------------------------------------------
+# rules_init "$project_dir" ["$global_dir"]
+# Load and merge config from global → project
+# ---------------------------------------------------------------------------
+_rules_load_config_file() {
+    local project_dir="$1"
+    local global_dir="${2:-}"
+
+    if [[ -n "$global_dir" ]] && [[ -f "$global_dir/.craft-config.yml" ]]; then
+        _rules_parse_config "$global_dir/.craft-config.yml" "global"
+    fi
+
+    # The plugin option outranks the global file and yields to the project
+    # file, the order config.sh resolves in. It used to be applied FIRST, so
+    # `strictness: relaxed` in ~/.claude/.craft-config.yml overrode an
+    # explicit `strict` option and disarmed post-write (guardrail review).
+    # Uppercased is how Claude Code exports the option; lowercase is the
+    # plugin's own internal export and what the suites set (see config.sh).
+    local _option_strictness
+    _option_strictness="${CLAUDE_PLUGIN_OPTION_STRICTNESS:-${CLAUDE_PLUGIN_OPTION_strictness:-}}"
+    if [[ -n "$_option_strictness" ]]; then
+        _RULES_STRICTNESS="$_option_strictness"
+        _RULES_STRICTNESS_IS_DEFAULT=false
+    fi
+
+    if [[ -f "$project_dir/.craft-config.yml" ]]; then
+        _rules_parse_config "$project_dir/.craft-config.yml" "project"
+    fi
+}
+
+# The seeded default, and whether it is still only a seed.
+#
+# `_RULES_STRICTNESS="strict"` was a literal here, so `config_default_strictness`
+# reached the banner and never the gate: a repository with history was told
+# `moderate` on the session line while every write was still resolved under
+# `strict`. A setting that two surfaces disagree about is worse than no setting.
+_rules_seed_strictness() {
+    local project_dir="$1"
+    _RULES_STRICTNESS="strict"
+    # Sourced here rather than assumed: a caller that loads only this file would
+    # otherwise fall back to `strict` and reopen the same gap between what the
+    # banner says and what the gate does. config.sh does not load this file, so
+    # there is no cycle.
+    if ! type config_default_strictness >/dev/null 2>&1; then
+        local _rules_config_lib
+        _rules_config_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config.sh"
+        # shellcheck source=/dev/null
+        [[ -f "$_rules_config_lib" ]] && source "$_rules_config_lib"
+    fi
+    if type config_default_strictness >/dev/null 2>&1; then
+        _RULES_STRICTNESS="$(config_default_strictness "$project_dir")"
+    fi
+    # A seed loses to any declared value, wherever it is declared. Without this
+    # flag a seeded `moderate` would have outranked a global `strictness: strict`,
+    # because the merge only lets a global override the literal `strict`.
+    _RULES_STRICTNESS_IS_DEFAULT=true
+}
+
+rules_init() {
+    local project_dir="$1"
+    local global_dir="${2:-}"
+
+    _rules_ensure_store
+    _RULES_PROJECT_DIR="$project_dir"
+    _rules_seed_strictness "$project_dir"
+
+    _rules_load_config_file "$project_dir" "$global_dir"
+
+    local rule_id
+    for rule_id in $(_rules_keys "pattern"); do
+        _rules_validate_custom "$rule_id"
+    done
+
+    for rule_id in $(_rules_keys "languages"); do
+        if ! _rules_has "pattern" "$rule_id"; then
+            _rules_validate_custom "$rule_id"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# rules_severity "$rule_id"
+# Returns block|warn|ignore for a rule (project-level, no directory override)
+# ---------------------------------------------------------------------------
+rules_severity() {
+    local rule_id="$1"
+    local sev
+    sev=$(_rules_get "severity" "$rule_id")
+    if [[ -n "$sev" ]]; then
+        echo "$sev"
+    else
+        _rules_default_severity "$rule_id"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# rules_severity_for_file "$path" "$rule_id"
+# Like rules_severity but with directory-level .craft-rules.yml override.
+# Walks up from file's directory looking for .craft-rules.yml, stops at project root.
+# ---------------------------------------------------------------------------
+# Walk directories from file up to project root, looking for .craft-rules.yml override.
+# Prints the overridden severity if found, prints nothing if no directory override exists.
+_rules_check_directory_override() {
+    local current_directory="$1"
+    local directory_key="$2"
+    local rule_id="$3"
+
+    if [[ -f "$current_directory/.craft-rules.yml" ]]; then
+        if ! _rules_has "dir_parsed" "$directory_key"; then
+            _rules_parse_dir_config "$current_directory/.craft-rules.yml" "$directory_key"
+            _rules_set "dir_parsed" "$directory_key" "1"
+        fi
+        local cached_severity
+        cached_severity=$(_rules_get "dir_cache" "${directory_key}:${rule_id}")
+        if [[ -n "$cached_severity" ]]; then
+            echo "$cached_severity"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# The severity this one directory declares for the rule, cache first.
+_rules_severity_in_dir() {
+    local directory="$1" rule_id="$2"
+    local directory_key cached
+    directory_key=$(echo "$directory" | sed 's|/|__|g')
+
+    cached=$(_rules_get "dir_cache" "${directory_key}:${rule_id}")
+    if [[ -n "$cached" ]]; then
+        echo "$cached"
+        return 0
+    fi
+
+    _rules_check_directory_override "$directory" "$directory_key" "$rule_id"
+}
+
+# The next directory up, or nothing when the walk is over. The project root and
+# "/" are absolute, so a relative path reaches neither: dirname of "." is "."
+# and the walk spins forever. Whoever calls this decides the path shape, so
+# termination cannot depend on them getting it right.
+_rules_next_dir_up() {
+    local directory="$1"
+    [[ "$directory" == "$_RULES_PROJECT_DIR" || "$directory" == "/" ]] && return 1
+
+    local parent
+    parent=$(dirname "$directory")
+    [[ "$parent" == "$directory" ]] && return 1
+    printf '%s' "$parent"
+}
+
+_rules_search_parent_dirs() {
+    local current_directory="$1"
+    local rule_id="$2"
+
+    while [[ -n "$current_directory" ]]; do
+        local severity
+        severity=$(_rules_severity_in_dir "$current_directory" "$rule_id") && {
+            echo "$severity"
+            return 0
+        }
+        current_directory=$(_rules_next_dir_up "$current_directory") || break
+    done
+    return 1
+}
+
+_rules_find_directory_override() {
+    local file_path="$1"
+    local rule_id="$2"
+
+    local current_directory
+    current_directory=$(dirname "$file_path")
+
+    _rules_search_parent_dirs "$current_directory" "$rule_id"
+}
+
+# Find the nearest directory containing .craft-rules.yml for a file path.
+# Prints the directory path, or nothing if no override directory exists.
+_rules_find_override_directory() {
+    local file_path="$1"
+    local current_directory
+    current_directory=$(dirname "$file_path")
+
+    while [[ -n "$current_directory" ]]; do
+        [[ -f "$current_directory/.craft-rules.yml" ]] && { echo "$current_directory"; return 0; }
+        [[ "$current_directory" == "$_RULES_PROJECT_DIR" || "$current_directory" == "/" ]] && break
+
+        local parent
+        parent=$(dirname "$current_directory")
+        # The two stops above are absolute, so a relative path never reaches
+        # either: dirname of "." is "." and the walk spins forever. Whoever
+        # calls this decides the path shape, so termination cannot depend on
+        # them getting it right. Stop as soon as dirname stops moving.
+        [[ "$parent" == "$current_directory" ]] && break
+        current_directory="$parent"
+    done
+    return 1
+}
+
+# Paths where the structural premise does not hold. A long setup method, a
+# fixture builder taking six arguments, a deeply nested data literal: those are
+# the normal shape of a test, not decay. A credential in a fixture is a
+# fixture, not a leak. Blocking on them is what teaches a developer to reach
+# for craftsman-ignore, and that habit then covers the real findings too.
+#
+# Degraded to warn, never dropped: the finding stays visible, it just stops
+# standing between the developer and their own test file. An explicit
+# directory override in .craft-rules.yml still wins over this, since a project
+# that means it should be able to say so.
+_RULES_TEST_PATH_RE='(^|/)(tests?|spec|__tests__|__mocks__|fixtures?|factories)(/|$)'
+
+# Case-insensitive: the case of a directory name is not semantic, and the
+# regex missed the PSR-4 convention this plugin's own primary stack uses.
+# `Tests/Unit/FooTest.php` resolved SEC001 to block while `tests/` resolved it
+# to warn, so the relaxation written to stop blocking on fixture credentials
+# missed the most common PHP layout. nocasematch is saved and restored rather
+# than set globally: it is shell-wide state and the hook shares its shell with
+# every other validator.
+_rules_is_test_path() {
+    # Restored by branching rather than by eval'ing `shopt -p`: the idiomatic
+    # save/restore is data-as-code, and SH004 is right to refuse it even when
+    # the string comes from the shell itself.
+    if shopt -q nocasematch; then
+        [[ "$1" =~ $_RULES_TEST_PATH_RE ]]
+        return $?
+    fi
+    local matched
+    shopt -s nocasematch
+    [[ "$1" =~ $_RULES_TEST_PATH_RE ]]
+    matched=$?
+    shopt -u nocasematch
+    return $matched
+}
+
+# Which rules a test path relaxes is the manifest's call (`relaxed_in_tests:
+# true` on the rule), read through the registry. The list this engine kept
+# was the one list of rule ids CLAUDE.md says it must not hold, and a pack
+# rule could not join it without an edit here.
+_rules_relaxed_in_tests() {
+    type rule_relaxed_in_tests >/dev/null 2>&1 && rule_relaxed_in_tests "$1"
+}
+
+# rules_baseline_holds <file> <rule> <severity>
+#
+# Exit 0 when this occurrence of the rule was already in the file at its mark,
+# so the finding must be reported without blocking.
+#
+# It lives in the engine, not in a front-end, for a reason the first version of
+# this feature demonstrated: it was written in post-write-check.sh alone, and a
+# file then passed the hook and failed CI, which is precisely the drift the
+# parity tests exist to prevent. Severity is the engine's decision, and this is
+# a severity decision.
+#
+# It is a separate function rather than a branch inside rules_severity_for_file
+# because both front-ends call that one through $(...). The occurrence counter
+# behind it lives in the shell, and a command substitution is a subshell: every
+# finding would come back as its own first occurrence, and a second bare
+# `except:` in a file marked with one would be waved through. Call this
+# directly.
+# Did a human write this rule id down for this file, rather than inherit it?
+#
+# A `.craft-rules.yml` entry, at project level or in a directory, names the rule
+# explicitly. A pack default plus a strictness level does not.
+rules_severity_is_explicit() {
+    local file_path="$1" rule_id="$2"
+    _rules_find_directory_override "$file_path" "$rule_id" >/dev/null 2>&1 && return 0
+    [[ -n "$(_rules_get "severity" "$rule_id")" ]] || return 1
+    # A global preference is not a statement about this repository, so it does
+    # not outrank this repository's mark.
+    [[ "$(_rules_get "severity_source" "$rule_id")" != "global" ]]
+}
+
+rules_baseline_holds() {
+    local file_path="$1" rule_id="$2" severity="$3"
+    [[ "$severity" != "block" ]] && return 1
+    # Cheapest exclusion first: no mark above the file means nothing can be
+    # pre-existing, and that answer costs no process, where the explicit-
+    # severity lookup below costs several forks per finding.
+    type rule_baseline_marked >/dev/null 2>&1 && ! rule_baseline_marked "$file_path" && return 1
+    # An explicit promotion outranks the mark. Writing `PY004: block` in
+    # .craft-rules.yml and watching the finding stay advisory is a setting
+    # silently ignored: the same class of defect as a strictness level that
+    # does nothing. The mark answers for what the engine decided on its own;
+    # it does not answer for what the user asked for by name.
+    rules_severity_is_explicit "$file_path" "$rule_id" && return 1
+    type rule_baseline_is_preexisting >/dev/null 2>&1 || return 1
+    rule_baseline_is_preexisting "$file_path" "$rule_id"
+}
+
+rules_severity_for_file() {
+    local file_path="$1"
+    local rule_id="$2"
+
+    local directory_severity
+    directory_severity=$(_rules_find_directory_override "$file_path" "$rule_id") && {
+        echo "$directory_severity"
+        return 0
+    }
+
+    local severity
+    severity=$(rules_severity "$rule_id")
+    if [[ "$severity" == "block" ]] \
+        && _rules_is_test_path "$file_path" \
+        && _rules_relaxed_in_tests "$rule_id"; then
+        echo "warn"
+        return 0
+    fi
+    echo "$severity"
+}
+
+# ---------------------------------------------------------------------------
+# rules_custom_list "$language"
+# Returns list of custom rule IDs for a given language (one per line)
+# ---------------------------------------------------------------------------
+rules_custom_list() {
+    local language="$1"
+    local rule_id
+
+    for rule_id in $(_rules_keys "languages"); do
+        local langs
+        langs=$(_rules_get "languages" "$rule_id")
+        # Check if language is in comma-separated list
+        local lang
+        local IFS=','
+        for lang in $langs; do
+            if [[ "$lang" == "$language" ]]; then
+                # Only include if severity is not ignore
+                local sev
+                sev=$(rules_severity "$rule_id")
+                if [[ "$sev" != "ignore" ]]; then
+                    echo "$rule_id"
+                fi
+                break
+            fi
+        done
+        unset IFS
+    done
+}
+
+# ---------------------------------------------------------------------------
+# rules_pattern "$rule_id"
+# Returns regex pattern for a custom rule
+# ---------------------------------------------------------------------------
+rules_pattern() {
+    local rule_id="$1"
+    _rules_get "pattern" "$rule_id"
+}
+
+# ---------------------------------------------------------------------------
+# rules_message "$rule_id"
+# Returns human-readable message for a custom rule
+# ---------------------------------------------------------------------------
+rules_message() {
+    local rule_id="$1"
+    _rules_get "message" "$rule_id"
+}
+
+# ---------------------------------------------------------------------------
+# rules_check_custom "$file" "$language"
+# Matches the language's custom rules against the file and reports each one
+# once, at its first matching line, through the caller's add_violation, with
+# the `line N: message` form the pack validators use (the pipeline reads the
+# line from it). Severity stays the caller's add_violation's to resolve.
+#
+# One pass for every front-end. Post-write and the pipeline each kept a loop
+# of their own and pre-write had none, so a `severity: block` rule refused a
+# file once it had landed and never before the write (CR-171). Returns before
+# starting any process when no custom rule is declared, since pre-write runs
+# on every write; and always returns 0, since the hooks trap a failing
+# command (post-write fails open on it, pre-write refuses the write).
+# ---------------------------------------------------------------------------
+rules_check_custom() {
+    local file="$1" language="$2"
+    [[ -n "$language" && -d "$_RULES_STORE/languages" ]] || return 0
+    local rule_id pattern first
+    while IFS= read -r rule_id; do
+        [[ -z "$rule_id" ]] && continue
+        pattern=$(rules_pattern "$rule_id")
+        [[ -z "$pattern" ]] && continue
+        # -e: repo-supplied pattern, see _rules_validate_pattern for the note
+        first=$(grep -nE -m 1 -e "$pattern" "$file" 2>/dev/null) || continue
+        add_violation "$rule_id" "line ${first%%:*}: $(rules_message "$rule_id")" "$file"
+    done <<< "$(rules_custom_list "$language")"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# rules_explain "$rule_id" ["$file_path"]
+# Shows where the rule's current severity comes from (traceability).
+# Output: "RULE_ID: severity (source: description)"
+# ---------------------------------------------------------------------------
+_explain_directory_override() {
+    local rule_id="$1" file_path="$2"
+    [[ -n "$file_path" ]] || return 1
+    local directory_severity override_directory
+    directory_severity=$(_rules_find_directory_override "$file_path" "$rule_id") || return 1
+    override_directory=$(_rules_find_override_directory "$file_path")
+    echo "$rule_id: $directory_severity (source: directory override ${override_directory}/.craft-rules.yml)"
+}
+
+_explain_configured() {
+    local rule_id="$1" configured_severity config_source
+    configured_severity=$(_rules_get "severity" "$rule_id")
+    [[ -n "$configured_severity" ]] || return 1
+    config_source="global ~/.claude/.craft-config.yml"
+    [[ -f "$_RULES_PROJECT_DIR/.craft-config.yml" ]] && config_source="project $_RULES_PROJECT_DIR/.craft-config.yml"
+    echo "$rule_id: $configured_severity (source: $config_source)"
+}
+
+rules_explain() {
+    local rule_id="$1"
+    local file_path="${2:-}"
+
+    _explain_directory_override "$rule_id" "$file_path" && return 0
+    _explain_configured "$rule_id" && return 0
+
+    # An advisory rule warns whatever the strictness is, so naming the
+    # strictness as the source would send the reader to change a setting that
+    # has no effect on it. Advisory means declared so by the owning manifest
+    # (#37), which is also where the reasoning behind the default lives.
+    if [[ "$(_rules_declared_severity "$rule_id")" == "warn" ]]; then
+        echo "$rule_id: warn (source: advisory by default, set '$rule_id: block' to enforce)"
+        return 0
+    fi
+
+    echo "$rule_id: $(_rules_default_severity "$rule_id") (source: default strictness '$_RULES_STRICTNESS')"
+}

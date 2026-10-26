@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Shared Test Helpers - Craftsman Test Framework
+# Source this from any test file to get assertions, counters, and JSON utils.
+#
+# Usage:
+#   source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/test-helpers.sh"
+#
+# Provides:
+#   - log_pass / log_fail - colored assertion logging with counters
+#   - assert_exit_code - check exit code of last piped result
+#   - assert_json_valid - validate JSON output
+#   - assert_json_field - check specific JSON field value
+#   - assert_json_contains - check JSON output contains string
+#   - assert_contains / assert_not_contains - string matching
+#   - run_hook - generic hook runner (stdin JSON → exit_code|output)
+#   - test_summary - print pass/fail summary, exit with correct code
+#   - setup_test_env / cleanup_test_env - temp directory management
+#
+# Strictness is pinned here, once, for every suite that sources this file.
+# The default is no longer a constant: a repository with history seeds
+# `moderate` (see config_default_strictness), and the suites run inside one, so
+# an unpinned assertion measured the ambient default instead of the rule it
+# names. A suite that asserts the DEFAULT itself clears this variable for that
+# one case, which is the only place the default belongs.
+# =============================================================================
+
+export CLAUDE_PLUGIN_OPTION_strictness="${CLAUDE_PLUGIN_OPTION_strictness:-strict}"
+# Claude Code exports the session id into every Bash subprocess, this suite
+# included, and the hooks name their state files after it. A suite that
+# asserts on the shared session-state.json would then read a file no hook
+# wrote. Unset here; a test that wants two sessions sets the id itself.
+# Grok exports its identity into tool subprocesses too. Tests name their own host.
+unset CRAFTSMAN_PLUGIN_DATA GROK_PLUGIN_DATA PLUGIN_DATA
+unset CLAUDE_CODE_SESSION_ID CODEX_SESSION_ID CODEX_THREAD_ID GROK_SESSION_ID GROK_HOOK_EVENT GROK_AGENT CRAFTSMAN_SESSION_ID CRAFTSMAN_SESSION_HOST
+
+# A git identity, once, for every fixture that commits. The ubuntu runner has
+# none configured, so `git commit --allow-empty` failed silently inside
+# `>/dev/null 2>&1`, every "repository with history" fixture had zero commits,
+# and the default resolved to `strict` where the assertion expected `moderate`.
+# Green on a developer's machine, red on the runner, for a reason that has
+# nothing to do with the code under test.
+export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-craftsman-tests}"
+export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-tests@craftsman.invalid}"
+export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-craftsman-tests}"
+export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-tests@craftsman.invalid}"
+
+# A failed cd leaves a test where it was. From inside the plugin repository
+# that turned a hostile-repository fixture into a commit on the real branch and
+# a rewritten .craftsman-baseline.json, when /tmp was not writable (review of
+# 4.12.0, CR-204 F10). Every script that sources this file stops instead, and
+# no git write lands in this repository from a test.
+_CRAFTSMAN_REPO_ROOT="$(builtin cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+cd() {
+    builtin cd "$@" && return 0
+    local rc=$?
+    case "$(pwd -P)/" in
+        "$_CRAFTSMAN_REPO_ROOT"/*)
+            echo "test-helpers: 'cd $*' failed inside the plugin repository; stopping before anything is written here" >&2
+            exit 97 ;;
+    esac
+    return $rc
+}
+git() {
+    local dir="." sub="${1:-}"
+    if [[ "${1:-}" == "-C" ]]; then dir="${2:-.}"; sub="${3:-}"; fi
+    case "$sub" in
+        init|add|commit|reset|checkout|switch|restore|rm|mv|stash|merge|rebase|cherry-pick|tag|push|clean|am|apply)
+            if [[ "$(command git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" == "$_CRAFTSMAN_REPO_ROOT" ]]; then
+                echo "test-helpers: refusing 'git $sub' inside the plugin repository" >&2
+                exit 97
+            fi ;;
+    esac
+    command git "$@"
+}
+
+# Guard against double-sourcing
+[[ -n "${_TEST_HELPERS_LOADED:-}" ]] && return 0
+_TEST_HELPERS_LOADED=1
+
+# --- Counters ---
+TESTS_PASSED=0
+TESTS_FAILED=0
+
+# --- Colors (safe for pipes) ---
+if [[ -t 1 ]]; then
+    _GREEN='\033[0;32m'
+    _RED='\033[0;31m'
+    _NC='\033[0m'
+else
+    _GREEN=''
+    _RED=''
+    _NC=''
+fi
+
+# --- Core Assertions ---
+
+log_pass() {
+    echo -e "  ${_GREEN}✓${_NC} $1"
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+}
+
+log_fail() {
+    echo -e "  ${_RED}✗${_NC} $1: ${2:-}"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+}
+
+# assert_exit_code "description" "expected" "actual"
+assert_exit_code() {
+    local desc="$1" expected="$2" actual="$3"
+    if [[ "$actual" == "$expected" ]]; then
+        log_pass "$desc"
+    else
+        log_fail "$desc" "expected exit $expected, got $actual"
+    fi
+}
+
+# assert_json_valid "description" "json_string"
+assert_json_valid() {
+    local desc="$1" json="$2"
+    if echo "$json" | jq . >/dev/null 2>&1; then
+        log_pass "$desc"
+    else
+        log_fail "$desc" "invalid JSON: $(echo "$json" | head -1)"
+    fi
+}
+
+# assert_json_field "description" "json_string" "field_path" "expected_value"
+assert_json_field() {
+    local desc="$1" json="$2" field="$3" expected="$4"
+    local actual
+    actual=$(echo "$json" | jq -r "$field" 2>/dev/null)
+    if [[ "$actual" == "$expected" ]]; then
+        log_pass "$desc"
+    else
+        log_fail "$desc" "expected $field=$expected, got $actual"
+    fi
+}
+
+# The text goes to grep as a here-string, never through a pipe: grep -q exits
+# on the first match, and under pipefail the writer's SIGPIPE turned a match
+# into a failure (tests/core/test-assert-helpers.sh).
+# assert_json_contains "description" "json_string" "pattern"
+assert_json_contains() {
+    local desc="$1" json="$2" pattern="$3"
+    if grep -qi -- "$pattern" <<<"$json"; then
+        log_pass "$desc"
+    else
+        log_fail "$desc" "JSON output does not contain '$pattern'"
+    fi
+}
+
+# assert_contains "description" "haystack" "needle"
+assert_contains() {
+    local desc="$1" haystack="$2" needle="$3"
+    if grep -qi -- "$needle" <<<"$haystack"; then
+        log_pass "$desc"
+    else
+        log_fail "$desc" "output does not contain '$needle'"
+    fi
+}
+
+# assert_not_contains "description" "haystack" "needle"
+assert_not_contains() {
+    local desc="$1" haystack="$2" needle="$3"
+    if ! grep -qi -- "$needle" <<<"$haystack"; then
+        log_pass "$desc"
+    else
+        log_fail "$desc" "output should not contain '$needle'"
+    fi
+}
+
+# --- Hook Runners ---
+
+# run_hook "hook_script_path" "stdin_json"
+# Returns: "exit_code|stdout"
+run_hook() {
+    local hook="$1" stdin_data="${2:-}"
+    local output exit_code
+    output=$(echo "$stdin_data" | bash "$hook" 2>/dev/null) || true
+    exit_code=${PIPESTATUS[1]:-$?}
+    # Re-run to get accurate exit code (pipe masks it)
+    if [[ -n "$stdin_data" ]]; then
+        echo "$stdin_data" | bash "$hook" >/dev/null 2>&1
+        exit_code=$?
+    else
+        bash "$hook" </dev/null >/dev/null 2>&1
+        exit_code=$?
+    fi
+    echo "$exit_code|$output"
+}
+
+# --- Environment ---
+
+# setup_test_env - create isolated temp dir, export CLAUDE_PLUGIN_DATA
+setup_test_env() {
+    export CLAUDE_PLUGIN_DATA="/tmp/craftsman-tests-$$"
+    mkdir -p "$CLAUDE_PLUGIN_DATA"
+}
+
+# Isolation is not opt-in. Only run-tests.sh used to redirect plugin data, so a
+# script that did not call setup_test_env itself measured one thing inside the
+# runner and another thing run on its own: under the runner it read an empty
+# state directory, alone it read the developer's real one, accumulated by every
+# previous run. tests/ci/test-ratchet-ci.sh passed in the suite and failed by
+# itself for exactly that reason, and the failure it reported was real.
+#
+# A test must mean the same thing wherever it is invoked from, so every script
+# that sources these helpers gets its own directory here, before its first line
+# runs. A script that wants a specific path still sets CLAUDE_PLUGIN_DATA after
+# sourcing, and wins.
+setup_test_env
+trap 'cleanup_test_env' EXIT
+
+# cleanup_test_env - remove temp dir
+cleanup_test_env() {
+    [[ -n "${CLAUDE_PLUGIN_DATA:-}" ]] && rm -rf "$CLAUDE_PLUGIN_DATA"
+}
+
+# --- Liveness preconditions for guard tests ---
+#
+# A security guard is usually asserted by the absence of something bad: no raw
+# markup in the page, no oversized file in the baseline, no attacker string in
+# the map. A dead program also produces absence, so those assertions cannot
+# tell a working guard from deleted code. Stubbing dashboard.py, codemap.py and
+# ratchet.py to `sys.exit(1)` left 19 of the 22 hostile-repo assertions green.
+#
+# Every absence assertion is therefore preceded by one of these, which fail
+# loudly when the tool under test produced nothing at all.
+
+# Gate the dependent assertion on these rather than merely reporting alongside
+# it. A guard whose tool never ran is not verified, it is undetermined, and
+# printing a green tick for it is the whole defect these helpers exist to close:
+#
+#   assert_produced_file "dashboard" "$OUT" && { ...absence assertion... }
+#
+# assert_produced_file <label> <path> - the tool wrote a non-empty artifact
+assert_produced_file() {
+    local label="$1" path="$2"
+    if [[ -s "$path" ]]; then
+        return 0
+    fi
+    log_fail "$label: tool produced no output" \
+        "guard assertions skipped - they would have passed against deleted code"
+    return 1
+}
+
+# assert_produced_output <label> <text> - the tool wrote something to stdout
+assert_produced_output() {
+    local label="$1" text="$2"
+    if [[ -n "$text" ]]; then
+        return 0
+    fi
+    log_fail "$label: tool produced no output" \
+        "guard assertions skipped - they would have passed against deleted code"
+    return 1
+}
+
+# tool_alive <label> <command...> - does this tool still work on benign input?
+# For guards asserted by an empty result (a size cap, a refusal), emptiness is
+# the pass condition, so liveness has to come from a separate benign run.
+tool_alive() {
+    local label="$1"; shift
+    if "$@" >/dev/null 2>&1; then
+        return 0
+    fi
+    log_fail "$label: tool does not run at all" \
+        "guard assertions skipped - emptiness would have read as a pass"
+    return 1
+}
+
+# Bridge files live in the real ~/.claude so skills can find them without
+# CLAUDE_PLUGIN_ROOT, which means any suite invoking session-start.sh rewrites
+# the developer's own bridges to throwaway test paths. Back them up as a set:
+# guarding them one by one is how the metrics bridge got clobbered by
+# test-hooks.sh the day it was introduced.
+_CRAFTSMAN_BRIDGES=(
+    "${HOME}/.claude/craftsman-session-state-path"
+    "${HOME}/.claude/craftsman-metrics-db-path"
+)
+
+backup_home_bridges() {
+    local bridge
+    for bridge in "${_CRAFTSMAN_BRIDGES[@]}"; do
+        [[ -f "$bridge" ]] && cp "$bridge" "${bridge}.test-backup"
+    done
+    return 0
+}
+
+restore_home_bridges() {
+    local bridge
+    for bridge in "${_CRAFTSMAN_BRIDGES[@]}"; do
+        [[ -f "${bridge}.test-backup" ]] && mv "${bridge}.test-backup" "$bridge"
+    done
+    return 0
+}
+
+# --- Portable timeout ---
+# The one implementation lives in hooks/lib/portable-timeout.sh, because a copy
+# here would drift from the one the product uses.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../hooks/lib" && pwd)/portable-timeout.sh"
+
+run_with_timeout() {
+    portable_timeout "$@"
+}
+
+# --- Summary ---
+
+# test_summary - print results and exit with correct code
+test_summary() {
+    echo ""
+    echo "==================================="
+    echo -e " ${_GREEN}Passed:${_NC} $TESTS_PASSED"
+    echo -e " ${_RED}Failed:${_NC} $TESTS_FAILED"
+    echo "==================================="
+    [[ $TESTS_FAILED -eq 0 ]] && exit 0 || exit 1
+}
+
+export CRAFTSMAN_RUNTIME_HOME="${CLAUDE_PLUGIN_DATA}/runtime-home"

@@ -1,0 +1,241 @@
+# CI Integration
+
+Craftsman quality rules run as Claude Code hooks during development. For CI/CD pipelines, the same rules are available via the standalone `craftsman-ci` CLI and four provider templates (GitHub Actions, GitLab CI, Bitbucket Pipelines, Jenkins), each with native annotations.
+
+## Quick Start
+
+Run inside your project root (where `ci/craftsman-ci.sh` lives):
+
+```bash
+# Scan src/ with default settings (strict, fullstack)
+bash ci/craftsman-ci.sh
+
+# JSON output for machine consumption
+bash ci/craftsman-ci.sh --format json > report.json
+
+# Scan specific paths
+bash ci/craftsman-ci.sh src/Domain/ src/Application/
+```
+
+Or use the `/craftsman:ci` skill to export a GitHub Actions workflow:
+
+```
+/craftsman:ci export
+/craftsman:ci status
+```
+
+## Configuration Options
+
+`craftsman-ci` reads configuration with the same priority order as the Claude Code hooks:
+
+1. `--config <file>` flag (highest)
+2. `.craft-config.yml` in the current directory
+3. `CLAUDE_PLUGIN_OPTION_*` environment variables
+4. Hardcoded defaults (lowest)
+
+### `.craft-config.yml`
+
+```yaml
+strictness: strict   # strict | moderate | relaxed
+stack: fullstack     # symfony | react | fullstack | other
+```
+
+### Strictness levels
+
+| Level | PHP rules | TS rules | Layer rules |
+|-------|-----------|----------|-------------|
+| `strict` | blocking | blocking | blocking |
+| `moderate` | warnings | warnings | blocking |
+| `relaxed` | warnings | warnings | warnings |
+
+### Stack values
+
+`symfony`, `react`, `fullstack` or `other`. The stack selects the doctrine
+the agents load and the hints `/craftsman:setup` proposes; it does not decide
+which files are scanned. Every language pack validates the files of its
+language whatever the stack says, so a `.php` file in a `react` project and a
+`.py` file in a `symfony` one are scanned like any other (#35). To leave a
+directory out, relax or ignore its rules in a `.craft-rules.yml` placed there.
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Clean - no violations, no warnings |
+| `1` | Warnings only |
+| `2` | Violations found |
+
+These follow standard CI conventions (compatible with `make`, GitHub Actions `if: failure()`, etc.).
+
+## GitHub Actions Integration
+
+### Export the workflow
+
+```
+/craftsman:ci export
+```
+
+This generates `.github/workflows/craftsman-quality-gate.yml` from the template at `ci/templates/craftsman-quality-gate.yml`.
+
+### Workflow behavior
+
+The workflow:
+- Triggers on pull requests and pushes to `main`
+- Auto-detects stack from `composer.json` / `package.json`
+- Runs PHPStan level 8 if available
+- Runs ESLint if available
+- Runs deptrac if available
+- Runs `craftsman-ci` and saves a JSON report
+- Posts results as a PR comment (updates existing comment on re-runs)
+- Fails the job if any violations are found
+
+### Minimal manual setup
+
+```yaml
+# .github/workflows/craftsman-quality-gate.yml
+name: Craftsman Quality Gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run craftsman-ci
+        run: bash ci/craftsman-ci.sh --format json > craftsman-report.json
+      - name: Check violations
+        run: |
+          violations=$(jq '.summary.violations' craftsman-report.json)
+          [ "$violations" -gt 0 ] && exit 1 || exit 0
+```
+
+## Custom CI Pipeline Integration
+
+### GitLab CI
+
+```yaml
+craftsman:
+  stage: quality
+  script:
+    - bash ci/craftsman-ci.sh --format json | tee craftsman-report.json
+    - violations=$(jq '.summary.violations' craftsman-report.json)
+    - "[ \"$violations\" -gt 0 ] && exit 1 || exit 0"
+  artifacts:
+    paths:
+      - craftsman-report.json
+    when: always
+```
+
+### Bitbucket Pipelines
+
+```yaml
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: Craftsman Quality Gate
+          script:
+            - bash ci/craftsman-ci.sh --format json > craftsman-report.json
+            - violations=$(jq '.summary.violations' craftsman-report.json)
+            - "[ \"$violations\" -gt 0 ] && exit 1 || exit 0"
+          artifacts:
+            - craftsman-report.json
+```
+
+### Pre-push Git hook
+
+```bash
+#!/usr/bin/env bash
+# .git/hooks/pre-push
+bash ci/craftsman-ci.sh --format text
+```
+
+## JSON Output Schema Reference
+
+```json
+{
+  "version": "4.10.3",
+  "timestamp": "2026-03-28T21:00:00Z",
+  "config": {
+    "strictness": "strict",
+    "stack": "fullstack"
+  },
+  "summary": {
+    "files_scanned": 42,
+    "violations": 3,
+    "warnings": 5
+  },
+  "violations": [
+    {
+      "rule": "PHP001",
+      "file": "src/Domain/Entity/User.php",
+      "line": 1,
+      "message": "Missing declare(strict_types=1)",
+      "severity": "critical"
+    }
+  ]
+}
+```
+
+### Severity values
+
+| Value | Description |
+|-------|-------------|
+| `critical` | Blocking violation (exit 2) |
+| `warning` | Non-blocking warning (exit 1) |
+
+### Rule codes
+
+Advisory rules warn whatever the strictness is. Set `RULE: block` in
+`.craft-config.yml` to enforce one in a codebase that has no exception to it.
+
+The list of rules is not written here. It is compiled from `rules/core.yml`
+and every loaded pack's `pack.yml`, so a table in this file describes one
+installation on one day. This one listed thirteen rules while the registry
+compiled sixty-six, with no security, Python, Go, Rust or Shell rule among
+them, and readers took it for the scope of the gate.
+
+Print the rules your installation enforces, with the severity each one
+resolves to:
+
+```bash
+bash ci/craftsman-ci.sh export --target agents-md   # writes AGENTS.md
+```
+
+The same content goes to `.cursor/rules/craftsman.mdc` with `--target cursor`
+and to `.github/copilot-instructions.md` with `--target copilot`.
+
+The layer rules read the project's root namespace from `composer.json`
+(`autoload.psr-4`, preferring the entry mapped to `src/`) and fall back to
+`App` when there is no `composer.json`. `PHP002` skips a class carrying
+`#[ORM\Entity]` or `@ORM\Entity`: a Doctrine proxy extends the entity, so a
+final entity breaks lazy loading. `TS002` skips the files where a framework
+resolves the module by its default export: `page`, `layout`, `route`,
+`middleware`, `loading`, `error`, `not-found`, `template`, `default`,
+`instrumentation`, anything under `pages/`, `*.stories.*`, `*.config.*` and
+`*.d.ts`.
+
+## Suppressing Rules
+
+Use `craftsman-ignore` comments in source files (identical to hook behavior):
+
+```php
+// craftsman-ignore: no-setter
+public function setLegacyField(string $value): void { ... }
+```
+
+```typescript
+const data = legacyApi() as any; // craftsman-ignore: no-any
+```
+
+Note: `craftsman-ignore` suppresses inline violations. File-level rules (like PHP001) require fixing the actual issue.
+
+## Cross-Harness Doctrine Export
+
+`craftsman-ci export` renders the active rules as agent instruction files: `AGENTS.md` (the format most agents read), `.cursor/rules/craftsman.mdc`, and `.github/copilot-instructions.md`. Targets: `agents-md`, `cursor`, `copilot`, `all`.
+
+The files are generated from the rules engine, so they always match what the gate enforces: a rule set to `ignore` disappears from them, a rule downgraded to `warn` is labelled as such. They carry a do-not-edit header and re-export is byte-stable, so committing them produces no git churn.
+
+This extends the doctrine to teammates whose harness cannot run craftsman hooks. It does not extend enforcement: those contributors are still gated by `craftsman-ci` in the pipeline, which runs the same validators as the local hooks.

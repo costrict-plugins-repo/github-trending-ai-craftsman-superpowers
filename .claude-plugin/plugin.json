@@ -1,0 +1,77 @@
+{
+  "name": "craftsman",
+  "description": "Refuses any edit that breaks your architecture rules, before it reaches disk. A prompt asks; this enforces. SOLID, Clean Architecture, hexagonal, DDD and legacy rescue, with the same rules in your editor and your CI.",
+  "version": "4.14.0",
+  "author": {
+    "name": "Alexandre Mallet",
+    "email": "contact@buldee.com",
+    "url": "https://github.com/BULDEE"
+  },
+  "homepage": "https://github.com/BULDEE/ai-craftsman-superpowers",
+  "repository": "https://github.com/BULDEE/ai-craftsman-superpowers",
+  "license": "Apache-2.0",
+  "keywords": [
+    "ddd",
+    "domain-driven-design",
+    "clean-architecture",
+    "tdd",
+    "craftsman",
+    "software-engineering",
+    "code-quality",
+    "symfony",
+    "react",
+    "typescript",
+    "php",
+    "testing",
+    "refactoring",
+    "methodology",
+    "quality-metrics",
+    "static-analysis",
+    "sentry",
+    "channels"
+  ],
+  "userConfig": {
+    "strictness": {
+      "type": "string",
+      "title": "Strictness Level",
+      "description": "Enforcement level: strict (block violations), moderate (block critical only), relaxed (warn only)",
+      "default": "strict"
+    },
+    "stack": {
+      "type": "string",
+      "title": "Tech Stack",
+      "description": "Your tech stack: symfony, react, fullstack or other. Selects the doctrine and the setup hints; every language pack validates its own files whatever the stack says.",
+      "default": "fullstack"
+    },
+    "agent_hooks": {
+      "type": "boolean",
+      "title": "Agent Hooks",
+      "description": "Enable background Haiku verification (DDD verifier on Write/Edit, final architecture review on Stop). Runs headless claude -p subprocesses on the Haiku tier: no main-context cost, wakes the session only when a violation is found. Disable to skip all model-based verification.",
+      "default": true
+    },
+    "packs": {
+      "type": "string",
+      "title": "Active Packs",
+      "description": "Comma-separated pack names to load (e.g., 'symfony,react,ai-ml'). Auto-detected from stack if not set.",
+      "default": ""
+    },
+    "sentry_org": {
+      "type": "string",
+      "title": "Sentry Organization",
+      "description": "Sentry organization slug for error context injection"
+    },
+    "sentry_project": {
+      "type": "string",
+      "title": "Sentry Project",
+      "description": "Sentry project slug to query errors from"
+    },
+    "sentry_token": {
+      "type": "string",
+      "title": "Sentry Token",
+      "description": "Sentry auth token (stored securely in keychain)",
+      "sensitive": true
+    }
+  },
+  "hooks": "./hooks/claude-code.json",
+  "types": "./mods/cockpit/types/index.d.ts"
+}

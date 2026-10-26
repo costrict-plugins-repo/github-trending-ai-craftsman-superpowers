@@ -1,0 +1,568 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Healthcheck Library - Plugin health verification functions
+#
+# Usage:
+#   source "${CLAUDE_PLUGIN_ROOT}/hooks/lib/healthcheck.sh"
+#   hc_run_all          # Run all checks, populate _HC_NAMES/_HC_STATUSES/_HC_MESSAGES arrays
+#   hc_summary          # One-line summary for SessionStart
+#   hc_full_report      # Full formatted report for /craftsman:healthcheck
+# =============================================================================
+
+# This library names the host, so it brings the library that reads it rather
+# than trusting its caller to have sourced it: skills/healthcheck/SKILL.md
+# sources config.sh, pack-loader.sh and this file, and `host_detect` was
+# undefined there, so a Claude Code session reported "unknown host" and
+# "load status unknown" about itself (measured 2026-09-20).
+_HC_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+type host_detect >/dev/null 2>&1 || source "${_HC_LIB_DIR}/host.sh"
+type skill_locked_files >/dev/null 2>&1 || source "${_HC_LIB_DIR}/skill-frontmatter.sh"
+
+declare -a _HC_NAMES=()
+declare -a _HC_STATUSES=()
+declare -a _HC_MESSAGES=()
+_HC_PASS=0
+_HC_TOTAL=0
+
+_hc_record() {
+    local name="$1" status="$2" message="$3"
+    _HC_NAMES+=("$name")
+    _HC_STATUSES+=("$status")
+    _HC_MESSAGES+=("$message")
+    (( _HC_TOTAL++ ))
+    [[ "$status" == "ok" ]] && (( _HC_PASS++ ))
+}
+
+# --- Individual checks ---
+
+hc_check_system_deps() {
+    local missing=""
+    command -v python3 >/dev/null 2>&1 || missing="${missing} python3"
+    command -v jq >/dev/null 2>&1 || missing="${missing} jq"
+    command -v sqlite3 >/dev/null 2>&1 || missing="${missing} sqlite3"
+
+    if [[ -z "$missing" ]]; then
+        _hc_record "system" "ok" "python3 jq sqlite3"
+    else
+        _hc_record "system" "error" "missing:${missing}"
+    fi
+}
+
+hc_check_node() {
+    if ! command -v node >/dev/null 2>&1; then
+        _hc_record "node" "error" "missing"
+        return
+    fi
+
+    local version
+    version=$(node --version 2>/dev/null | sed 's/^v//')
+    local major
+    major=$(echo "$version" | cut -d. -f1)
+
+    if [[ "$major" -ge 20 ]]; then
+        _hc_record "node" "ok" "v${version}"
+    else
+        _hc_record "node" "warn" "v${version} (need >=20)"
+    fi
+}
+
+# Present is not valid: a pre-v4 file with a `stack:` mapping was reported ok
+# while the resolver ignored the stack it set. Each file is judged by
+# config_validate, the schema read with the resolver's own reader.
+hc_check_config() {
+    type config_validate >/dev/null 2>&1 || source "${_HC_LIB_DIR}/config.sh"
+    local file found="" problems="" problem
+    for file in "${PWD}/.craft-config.yml" "$(config_global_file)"; do
+        [[ -n "$file" && -f "$file" ]] || continue
+        [[ " $found " == *" ${file} "* ]] && continue
+        found="${found:+$found }${file}"
+        while IFS= read -r problem; do
+            problems+="${file}: ${problem};"
+        done < <(config_validate "$file")
+    done
+    # A file without the v4 marker is every config written before 4.12.2:
+    # warned with what the resolver ignores and how to migrate. An error is
+    # for a v4 file whose values are wrong, which no upgrade explains.
+    if [[ -z "$found" ]]; then
+        _hc_record "config" "warn" "missing - run /craftsman:setup"
+    elif [[ "$problems" == *"a format before v4"* ]]; then
+        _hc_record "config" "warn" "${problems%;} - run /craftsman:setup"
+    elif [[ -n "$problems" ]]; then
+        _hc_record "config" "error" "${problems%;} - run /craftsman:setup"
+    else
+        _hc_record "config" "ok" "v4: ${found}"
+    fi
+}
+
+hc_check_packs() {
+    local loaded
+    loaded=$(pack_loaded 2>/dev/null || echo "")
+
+    if [[ -z "$loaded" ]]; then
+        _hc_record "packs" "warn" "none loaded"
+        return
+    fi
+
+    local pack_list
+    pack_list=$(echo "$loaded" | tr '\n' ' ' | sed 's/ $//')
+    _hc_record "packs" "ok" "$pack_list"
+}
+
+hc_check_metrics_db() {
+    local db_path counts
+    # The data directory session-files.sh already bound in this shell, which is
+    # where metrics-db.sh puts the database; a python3 start only without one.
+    db_path="${_CRAFTSMAN_SESSION_DATA_DIR:+${_CRAFTSMAN_SESSION_DATA_DIR}/metrics.db}"
+    [[ -n "$db_path" ]] || db_path=$(python3 "${_HC_LIB_DIR}/runtime_paths.py" metrics 2>/dev/null) || { _hc_record "metrics" "warn" "native session data binding unavailable"; return; }
+    if [[ -f "$db_path" ]]; then
+        counts=$(sqlite3 -separator ' ' "$db_path" "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM violations);" 2>/dev/null) || counts="0 0"
+        _hc_record "metrics" "ok" "${counts%% *} sessions, ${counts##* } violations (${db_path})"
+    else
+        _hc_record "metrics" "warn" "DB not found"
+    fi
+}
+
+hc_check_channels() {
+    if type channel_health &>/dev/null 2>&1; then
+        local sentry_health
+        sentry_health=$(channel_health "sentry" 2>/dev/null || echo "unknown")
+        _hc_record "channels" "ok" "sentry:${sentry_health}"
+    else
+        _hc_record "channels" "ok" "no channels configured"
+    fi
+}
+
+hc_check_superpowers() {
+    local sp_dir=""
+    for d in "${HOME}/.claude/plugins/cache/claude-plugins-official/superpowers"/* "${HOME}/.claude/plugins/superpowers"; do
+        [[ -d "$d" ]] && sp_dir="$d" && break
+    done
+
+    if [[ -n "$sp_dir" ]]; then
+        local version="unknown"
+        if [[ -f "${sp_dir}/plugin.json" ]]; then
+            version=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('version','?'))" "${sp_dir}/plugin.json" 2>/dev/null || echo "?")
+        fi
+        _hc_record "superpowers" "ok" "v${version} - synergy active"
+    else
+        _hc_record "superpowers" "ok" "not installed (optional)"
+    fi
+}
+
+# /craftsman:team's native mode depends on an experimental env flag; without it
+# the skill degrades to parallel subagent dispatch. Status is "ok" either way:
+# absence is a mode, not a fault. The message tells the user which mode they get.
+hc_check_agent_teams() {
+    local host="${CRAFTSMAN_SESSION_HOST:-$(host_detect "")}"
+    if [[ "$host" != "claude-code" ]]; then
+        _hc_record "agent-teams" "ok" "${host}: host-native subagents; Claude team flag does not apply"
+        return
+    fi
+    if [[ -n "${CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS:-}" ]]; then
+        _hc_record "agent-teams" "ok" "native teams enabled"
+    else
+        _hc_record "agent-teams" "ok" "env flag not set - /craftsman:team runs in degraded parallel mode"
+    fi
+}
+
+# The bridge is Claude Code's: its skills run in a Bash tool that carries no
+# plugin data directory, so session-start.sh writes the path there for them.
+# Another host has no such file and must not be judged by it: a Codex session
+# read this row as a bridge into the wrong home (measured 2026-09-20). There,
+# what matters is that this installation has a data directory it can write.
+# On a host that is not Claude Code, what matters is that this installation
+# has a data directory it can write; the ~/.claude bridge belongs to another
+# host and judging Codex by it reported a bridge into the wrong home
+# (measured 2026-09-20).
+_hc_bridge_elsewhere() {
+    local host="$1" data
+    data=$(python3 "${_HC_LIB_DIR}/runtime_paths.py" data 2>/dev/null) || data=""
+    if [[ -z "$data" ]]; then
+        _hc_record "session-bridge" "warn" "${host}: no plugin data directory in this process; session state is unavailable until trusted SessionStart runs"
+    elif [[ -d "$data" && -w "$data" ]]; then
+        _hc_record "session-bridge" "ok" "${host}: session state under ${data} (the ~/.claude bridge is Claude Code's and is not written here)"
+    else
+        _hc_record "session-bridge" "error" "${host}: plugin data directory ${data} is not writable"
+    fi
+}
+
+# Claude Code reads agents/ from the plugin itself; Codex reads TOML roles
+# from its own home, and installing the plugin does not put them there. The
+# export writes them (`craftsman-ci export --target codex-agents --into
+# "$CODEX_HOME/agents"`), and once written all twelve are offered to
+# spawn_agent and spawn (measured 2026-09-20). Until then a Codex session has
+# the skills and none of the roles, which is worth a line rather than a
+# silence.
+hc_check_agent_roles() {
+    local host="${CRAFTSMAN_SESSION_HOST:-}" dir count
+    [[ -z "$host" ]] && type host_detect >/dev/null 2>&1 && host=$(host_detect "")
+    if [[ "$host" != "codex" ]]; then
+        _hc_record "agent-roles" "ok" "read from the plugin by this host"
+        return
+    fi
+    dir="${CODEX_HOME:-${HOME}/.codex}/agents"
+    count=$(ls "$dir"/craftsman-*.toml 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "${count:-0}" -gt 0 ]]; then
+        _hc_record "agent-roles" "warn" "${count} craftsman role files in ${dir}; native role loading not measured here"
+    else
+        _hc_record "agent-roles" "warn" "no craftsman role in ${dir}: Codex 0.155.1 loads roles from config layers, not plugin manifests. Plugin agent missions remain available under agents/"
+    fi
+}
+
+# The bridge is Claude Code's: its skills run in a Bash tool that carries no
+# plugin data directory, so session-start.sh writes the path there for them.
+hc_check_session_bridge() {
+    local bridge="${HOME}/.claude/craftsman-session-state-path" host="${CRAFTSMAN_SESSION_HOST:-}" target
+    [[ -z "$host" ]] && type host_detect >/dev/null 2>&1 && host=$(host_detect "")
+    if [[ "$host" != "claude-code" && "$host" != "unknown" ]]; then
+        _hc_bridge_elsewhere "$host"
+        return
+    fi
+    [[ -f "$bridge" ]] || { _hc_record "session-bridge" "warn" "missing - restart session to create"; return; }
+    target=$(< "$bridge")
+    [[ -n "$target" ]] || { _hc_record "session-bridge" "error" "empty - restart session to fix"; return; }
+    [[ -d "$(dirname "$target")" ]] || { _hc_record "session-bridge" "warn" "target dir missing: $(dirname "$target")"; return; }
+    _hc_record "session-bridge" "ok" "$target"
+}
+
+# The host this session runs under, and what the plugin can observe there.
+# One number ("9/11") hid the loss of the main gate (research CR-131, R11);
+# this row says, per capability, whether it is measured on this host. The
+# facts are the captured ones (tests/fixtures/hosts/PROVENANCE.md): Codex
+# sends no exit code for a shell command and ignores the `ask` decision,
+# Claude Code sends both. `CRAFTSMAN_SESSION_HOST` is set by session-start.sh
+# from its payload; a skill running later reads the environment instead.
+# What the host can do is read from the matrix, never from a case per host:
+# the case here knew Claude Code and Codex, and a Grok session (captured
+# 2026-09-15) was reported "unknown host" while the same file already said
+# what Copilot could not do. A host absent from the matrix is unqualified and
+# said so; one present is described by what was measured for it.
+hc_check_host() {
+    local host="${CRAFTSMAN_SESSION_HOST:-}" capabilities="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/hooks/host-capabilities.json" row
+    if [[ -z "$host" ]] && type host_detect >/dev/null 2>&1; then
+        host=$(host_detect "")
+    fi
+    row=$(jq -r --arg h "$host" '
+        .hosts[$h] // empty
+        | [ $h + " (qualified " + (.version // "?") + ")",
+            (if .exit_code_observable then "test exit codes observable (verification loop live)" else "shell exit codes NOT observable (a test run grants and revokes nothing)" end),
+            (if .ask_supported then "PreToolUse ask honoured" else "PreToolUse ask unsupported (gate config denied instead)" end),
+            ("skills read from " + (.skills_dir // "?")) ]
+        | .[0] + ": " + (.[1:] | join(", "))' "$capabilities" 2>/dev/null)
+    if [[ -n "$row" ]]; then
+        local version="${CODEX_VERSION:-}"
+        [[ "$host" != "codex" ]] && version=""
+        [[ -n "$version" ]] && row="running ${host} ${version}; ${row}"
+        _hc_record "host" "ok" "$row"
+    else
+        _hc_record "host" "warn" "${host:-unknown} host: capabilities not qualified in hooks/host-capabilities.json; gates run, ask is treated as unsupported"
+    fi
+}
+
+# Declared is not loaded, loaded is not triggered. hooks.json declares N
+# handlers on M events; which of those events the host loads is measured per
+# host in hooks/host-capabilities.json (Codex 0.154.0 loads 11 of the 12 kinds
+# this plugin declares on: not TaskCompleted, PostToolUseFailure or
+# FileChanged, audit CR-117 C10). A handler on an event the host does not load
+# is named here with the function it carries, so a declaration ignored never
+# counts as an active function. Triggered is this session's evidence only.
+# Grok (and any host whose matrix sets plugin_hooks_executed to false) lists
+# a plugin's hooks/hooks.json and runs none of it. The write gate is live
+# there only when a project or global hooks file actually calls
+# pre-write-check.sh. The gate path is the row's gate_file.
+# host_hooks.py --gate-rel answers the same lookup; this runs on every
+# SessionStart, where its python3 start was the healthcheck's largest cost to
+# learn that Claude Code and Codex declare no gate file.
+_hc_gate_relpath() {
+    local root="$1" host="$2"
+    jq -r --arg host "$host" '.hosts[$host].gate_file // empty | strings' \
+        "$root/hooks/host-capabilities.json" 2>/dev/null
+}
+
+_hc_host_gate_file() {
+    local host="$1" capabilities="$2" root rel f
+    root="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+    rel=$(_hc_gate_relpath "$root" "$host")
+    [[ -n "$rel" ]] || return 1
+    for f in "${PWD}/${rel}" "${HOME}/${rel}"; do
+        [[ -f "$f" ]] || continue
+        jq -e '.. | strings | select(test("pre-write-check\\.sh"))' "$f" >/dev/null 2>&1 || continue
+        printf '%s' "$f"
+        return 0
+    done
+    return 1
+}
+
+# jq's // treats boolean false as missing, so a host that does not run
+# plugin hooks would be read as "they run". has() then the value.
+_hc_plugin_hooks_run() {
+    jq -r --arg h "$1" '
+        .hosts[$h] | if has("plugin_hooks_executed") then .plugin_hooks_executed else true end' "$2" 2>/dev/null
+}
+
+hc_check_hooks_declared() {
+    local root="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}" manifest capabilities host declared events missing
+    manifest="$root/hooks/hooks.json"; capabilities="$root/hooks/host-capabilities.json"
+    [[ -f "$manifest" ]] || { _hc_record "hooks" "error" "hooks.json missing"; return; }
+    declared=$(jq '[.hooks[][] | .hooks[]] | length' "$manifest" 2>/dev/null || echo "?")
+    events=$(jq -r '.hooks | keys | join(",")' "$manifest" 2>/dev/null)
+    host="${CRAFTSMAN_SESSION_HOST:-}"
+    [[ -z "$host" ]] && type host_detect >/dev/null 2>&1 && host=$(host_detect "")
+    # No evidence is not "every event loads": an unknown host, or a host the
+    # matrix does not record, is said so (review of 5cc64f4, F2).
+    if [[ ! -f "$capabilities" ]] || ! jq -e --arg h "$host" '.hosts[$h]' "$capabilities" >/dev/null 2>&1; then
+        _hc_record "hooks" "warn" "${declared} handlers declared on ${events}; which of them ${host:-this host} loads is not recorded in hooks/host-capabilities.json, so none is counted as active here"
+        return
+    fi
+    missing=$(jq -r --arg h "$host" --slurpfile m "$manifest" '
+        .event_functions as $f
+        | (($m[0].hooks | keys) - .hosts[$h].events_loaded)
+        | map(. + " (" + ($f[.] // "function not named") + ")")
+        | join("; ")' "$capabilities" 2>/dev/null) || missing="__query_failed__"
+    if [[ "$missing" == "__query_failed__" ]]; then
+        _hc_record "hooks" "warn" "${declared} handlers declared; the capability query failed, loaded events unknown"
+        return
+    fi
+    if [[ -n "$missing" ]]; then
+        _hc_record "hooks" "warn" "${declared} handlers declared on ${events}; NOT loaded by ${host}: ${missing}. Trusted is the host's /hooks view, not measured here"
+    else
+        _hc_record "hooks" "ok" "${declared} handlers declared on ${events}; every event is one ${host:-this host} loads. Trusted is the host's /hooks view, not measured here"
+    fi
+}
+
+# A host whose matrix row records a trust step runs installed hooks only after
+# that step, which this process cannot observe: warn and name /hooks. A host
+# with no trust step runs them on install, so the row is ok.
+_hc_record_plugin_gate() {
+    local trust
+    trust=$(jq -r --arg h "$1" '.hosts[$h].trust // empty' "$2" 2>/dev/null)
+    if [[ -z "$trust" ]]; then
+        _hc_record "write-gate" "ok" "${1}: plugin hooks run on install"
+        return
+    fi
+    _hc_record "write-gate" "warn" "${1}: installing does not trust plugin hooks; trust is not measured here. Check the native /hooks view"
+}
+
+# Plugin hooks listed is not plugin hooks executed. Grok 1.0.30 and 1.0.34
+# list hooks/hooks.json and run none of it; the write gate is live only
+# through a project or global craftsman.json that calls pre-write-check.sh.
+hc_check_write_gate() {
+    local root capabilities host plugin_run gate
+    root="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+    capabilities="$root/hooks/host-capabilities.json"
+    host="${CRAFTSMAN_SESSION_HOST:-}"
+    [[ -z "$host" ]] && type host_detect >/dev/null 2>&1 && host=$(host_detect "")
+    if [[ ! -f "$capabilities" ]] || ! jq -e --arg h "$host" '.hosts[$h]' "$capabilities" >/dev/null 2>&1; then
+        _hc_record "write-gate" "ok" "host not in matrix; hooks row covers this"
+        return
+    fi
+    plugin_run=$(_hc_plugin_hooks_run "$host" "$capabilities")
+    if [[ "$plugin_run" != "false" && "$plugin_run" != "not observed"* ]]; then
+        _hc_record_plugin_gate "$host" "$capabilities"
+        return
+    fi
+    gate=$(_hc_host_gate_file "$host" "$capabilities") || gate=""
+    if [[ -n "$gate" ]]; then
+        _hc_record_gate_owner "$host" "$root" "$gate"
+        return
+    fi
+    local rel installer
+    rel=$(_hc_gate_relpath "$root" "$host")
+    installer=$(jq -r --arg h "$host" '.hosts[$h].gate_export.installer // empty' "$capabilities" 2>/dev/null)
+    _hc_record "write-gate" "warn" "${host}: this host runs none of the plugin's own hooks, so the write gate is inert until craftsman-ci export --target ${host}-hooks writes ~/${rel}${installer:+ (${installer} does this)}"
+}
+
+# A generated gate names the install that wrote it. Same root and same
+# commit: ok. Same root, older commit or version: warn, and say how to
+# refresh. Another root, or no marker: error, and name both paths. A file
+# that merely calls pre-write-check.sh is not owned.
+_hc_physical_dir() {
+    local path="$1"
+    if [[ -d "$path" ]]; then
+        (cd "$path" && pwd -P)
+        return 0
+    fi
+    printf '%s' "$path"
+}
+
+_hc_record_gate_owner() {
+    local host="$1" root="$2" gate="$3"
+    local marker_root marker_commit marker_version here_root here_commit here_version
+    marker_root=$(jq -r '.craftsman.root // empty' "$gate" 2>/dev/null)
+    here_root=$(_hc_physical_dir "$root")
+    if [[ -z "$marker_root" ]]; then
+        marker_root=$(_hc_legacy_root "$gate")
+        if [[ -n "$marker_root" ]] && [[ "$(_hc_physical_dir "$marker_root")" == "$here_root" ]]; then
+            _hc_record "write-gate" "warn" "${host}: gate ${gate} has no owner marker. craftsman-ci export --target ${host}-hooks"
+            return 0
+        fi
+        _hc_record "write-gate" "error" "${host}: gate ${gate} belongs to ${marker_root:-nowhere}, this install is ${here_root}. craftsman-ci export --target ${host}-hooks"
+        return 0
+    fi
+    marker_root=$(_hc_physical_dir "$marker_root")
+    if [[ "$marker_root" != "$here_root" ]]; then
+        _hc_record "write-gate" "error" "${host}: gate ${gate} belongs to ${marker_root}, this install is ${here_root}"
+        return 0
+    fi
+    marker_version=$(jq -r '.craftsman.version // empty' "$gate" 2>/dev/null)
+    marker_commit=$(jq -r '.craftsman.commit // empty' "$gate" 2>/dev/null)
+    here_version=$(jq -r '.version // empty' "$root/.claude-plugin/plugin.json" 2>/dev/null)
+    here_commit=$(git -C "$root" rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown')
+    if [[ "$marker_version" != "$here_version" || "$marker_commit" != "$here_commit" ]]; then
+        _hc_record "write-gate" "warn" "${host}: gate ${gate} is behind this install. craftsman-ci export --target ${host}-hooks"
+        return 0
+    fi
+    _hc_record "write-gate" "ok" "engine wired via ${gate}"
+}
+
+# Rewrite the host's global gate only when the marker root is this install.
+# A missing file is left missing. A foreign root is left byte for byte.
+_hc_legacy_root() {
+    jq -r '[.. | strings | capture("CLAUDE_PLUGIN_ROOT=(?<root>[^ \"]+)").root] | map(select(length > 0)) | .[0] // empty' "$1" 2>/dev/null
+}
+
+_hc_gate_current() {
+    local root="$1" gate="$2" marker_commit marker_version here_commit here_version
+    marker_commit=$(jq -r '.craftsman.commit // empty' "$gate" 2>/dev/null)
+    marker_version=$(jq -r '.craftsman.version // empty' "$gate" 2>/dev/null)
+    [[ -n "$marker_commit" && -n "$marker_version" ]] || return 1
+    here_version=$(jq -r '.version // empty' "$root/.claude-plugin/plugin.json" 2>/dev/null)
+    here_commit=$(git -C "$root" rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown')
+    [[ "$marker_commit" == "$here_commit" && "$marker_version" == "$here_version" ]]
+}
+
+hc_refresh_owned_gate() {
+    local root host rel gate marker here
+    root="${CLAUDE_PLUGIN_ROOT:-$(cd "${_HC_LIB_DIR}/../.." && pwd)}"
+    root=$(cd "$root" && pwd -P)
+    host="${CRAFTSMAN_SESSION_HOST:-}"
+    [[ -z "$host" ]] && type host_detect >/dev/null 2>&1 && host=$(host_detect "")
+    [[ -n "$host" && "$host" != "unknown" ]] || return 0
+    rel=$(_hc_gate_relpath "$root" "$host")
+    [[ -n "$rel" ]] || return 0
+    gate="${HOME}/${rel}"
+    [[ -f "$gate" ]] || return 0
+    marker=$(jq -r '.craftsman.root // empty' "$gate" 2>/dev/null)
+    [[ -n "$marker" ]] || marker=$(_hc_legacy_root "$gate")
+    [[ -n "$marker" ]] || return 0
+    here=$(_hc_physical_dir "$marker")
+    [[ "$here" == "$root" ]] || return 0
+    _hc_gate_current "$root" "$gate" && return 0
+    python3 "$root/ci/host_hooks.py" "$host" "$root" "$gate" >/dev/null 2>&1 || return 0
+}
+# --- Aggregate ---
+
+# Level 1.5 semantic validation (ADR-0019, amended): report which language
+# servers are installed. The plugin never installs one and never ships an
+# .lsp.json - Claude Code spawns a declared server unconditionally and surfaces
+# a plugin error when the binary is missing, so LSP wiring belongs to the
+# official per-language plugins the user opts into.
+# Which server serves which language is the packs' knowledge, not a literal list.
+# A hook process gets a narrower PATH than the user's shell: measured
+# 2026-09-20, the SessionStart banner said "lsp: none installed" while the
+# same check run from the Bash tool of the same session found four servers
+# (/opt/homebrew/bin and ~/.local/bin are on one PATH and not the other), so
+# the banner told the user to install what was already installed. The
+# language servers are user installs, so the usual user locations are
+# searched too, and the wording says where it looked.
+_hc_lookup_path() {
+    printf '%s' "${PATH}:${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:${HOME}/.cargo/bin:${HOME}/go/bin:${HOME}/.composer/vendor/bin"
+}
+
+_hc_installed_servers() {
+    local language server lookup
+    lookup=$(_hc_lookup_path)
+    while IFS= read -r language; do
+        server=$(lang_capability "$language" lsp 2>/dev/null)
+        [[ -z "$server" ]] && continue
+        PATH="$lookup" command -v "$server" >/dev/null 2>&1 && printf ' %s(%s)' "$server" "$language"
+    done <<< "$(lang_known_registered 2>/dev/null)"
+}
+
+hc_check_lsp() {
+    local found hints=""
+    found=$(_hc_installed_servers)
+    if [[ -n "$found" ]]; then
+        _hc_record "lsp" "ok" "level-1.5 active:${found}"
+    else
+        # The servers come from the packs' `lsp` capability, so a pack added
+        # later names its own; the plugin side is Claude Code's official LSP
+        # plugin for that server.
+        hints="none found on this process's PATH nor in the usual user install locations - Level 1.5 inactive; install one of the language servers the packs declare ($(lang_all_known_capability lsp 2>/dev/null | tr '\n' ' ' | sed 's/ $//')) plus the official Claude Code LSP plugin for it"
+        _hc_record "lsp" "warn" "$hints"
+    fi
+}
+
+# How many skills a model can actually start (#48). Fifteen of twenty-two are
+# locked with `disable-model-invocation: true` and start only when the user
+# types them; a healthcheck that counted "22 skills" hid that the model can
+# reach seven. Read from the frontmatter, the same authority the routing table
+# reads, so the two numbers cannot disagree.
+hc_check_skills() {
+    local root skill locked=0 skills=()
+    root="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+    for skill in "$root"/skills/*/SKILL.md; do
+        [[ -f "$skill" ]] && skills+=("$skill")
+    done
+    if [[ ${#skills[@]} -eq 0 ]]; then
+        _hc_record "skills" "warn" "none found"
+        return
+    fi
+    while IFS= read -r skill; do
+        locked=$((locked + 1))
+    done < <(skill_locked_files "${skills[@]}")
+    _hc_record "skills" "ok" "$(( ${#skills[@]} - locked )) of ${#skills[@]} model-invocable, ${locked} user-typed"
+}
+
+hc_run_all() {
+    _HC_NAMES=()
+    _HC_STATUSES=()
+    _HC_MESSAGES=()
+    _HC_PASS=0
+    _HC_TOTAL=0
+
+    hc_check_system_deps
+    hc_check_node
+    hc_check_host
+    hc_check_hooks_declared
+    hc_check_write_gate
+    hc_check_config
+    hc_check_packs
+    hc_check_skills
+    hc_check_metrics_db
+    hc_check_channels
+    hc_check_lsp
+    hc_check_superpowers
+    hc_check_agent_teams
+    hc_check_agent_roles
+    hc_check_session_bridge
+}
+
+hc_summary() {
+    hc_run_all
+
+    local failures=""
+    for i in "${!_HC_NAMES[@]}"; do
+        if [[ "${_HC_STATUSES[$i]}" != "ok" ]]; then
+            failures="${failures}, ${_HC_NAMES[$i]}: ${_HC_MESSAGES[$i]}"
+        fi
+    done
+
+    if [[ -z "$failures" ]]; then
+        echo "Healthcheck: ${_HC_PASS}/${_HC_TOTAL} ok"
+    else
+        failures="${failures#, }"
+        echo "Healthcheck: ${_HC_PASS}/${_HC_TOTAL} (${failures})"
+    fi
+}
+
+hc_json() {
+    hc_run_all
+
+    local json_array="[]"
+    for i in "${!_HC_NAMES[@]}"; do
+        json_array=$(echo "$json_array" | jq -c --arg n "${_HC_NAMES[$i]}" --arg s "${_HC_STATUSES[$i]}" --arg m "${_HC_MESSAGES[$i]}" '. + [{name: $n, status: $s, message: $m}]')
+    done
+
+    echo "$json_array"
+}

@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# =============================================================================
+# No subtest may leave a trace outside its own temp directories.
+#
+# A test that writes into the checkout or into ~/.claude makes every test that
+# runs after it depend on the order. That is how a suite gets a failure it
+# cannot reproduce: the script passes alone, fails in the suite, and the advice
+# "run it yourself" cannot work because the state that caused it is gone.
+#
+# This audit runs every subtest the suite runs and reports the ones that leave
+# something behind. It costs a full suite run, so it is opt-in:
+#
+#   CRAFTSMAN_ISOLATION_AUDIT=1 bash tests/core/test-suite-isolation.sh
+#
+# Without the variable it exits 0 after saying so, which keeps the default
+# suite fast while leaving the audit one command away.
+# =============================================================================
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$SCRIPT_DIR/../lib/test-helpers.sh"
+
+echo ""
+echo "=== The runner redirects plugin data away from the real database ==="
+
+# Cheap, runs in the default suite. metrics-db.sh falls back to
+# ~/.claude/plugins/data/craftsman when CLAUDE_PLUGIN_DATA is unset, so a
+# runner that does not export it makes every subtest record its fixtures as
+# production violations. The deep audit below cannot catch a regression here:
+# it sets the variable itself, so it would pass while the runner leaked.
+if grep -qE '^[[:space:]]*export CLAUDE_PLUGIN_DATA' "$ROOT_DIR/tests/run-tests.sh"; then
+    log_pass "run-tests.sh exports CLAUDE_PLUGIN_DATA"
+else
+    log_fail "run-tests.sh does not export CLAUDE_PLUGIN_DATA" \
+        "the suite writes its fixtures into ~/.claude/plugins/data/craftsman/metrics.db"
+fi
+
+# A subtest must not need the runner to be honest. When only run-tests.sh
+# redirected plugin data, a script run on its own read the developer's real
+# state directory instead of an empty one, so it measured something else:
+# tests/ci/test-ratchet-ci.sh passed in the suite and failed alone, and the
+# failure it reported alone was the true one. Sourcing the helpers is what every
+# test already does, so that is where the isolation has to happen.
+# Sourced in a fresh bash, not in a subshell: this script has already sourced
+# the helpers, and their double-source guard would return before the isolation
+# runs. The subshell version of this check reported the failure it was written
+# to detect, on a tree where the fix was present.
+HELPER_DATA=$(
+    unset CLAUDE_PLUGIN_DATA
+    env -u CLAUDE_PLUGIN_DATA -u _TEST_HELPERS_LOADED bash -c \
+        'source "$1" >/dev/null 2>&1; printf "%s" "${CLAUDE_PLUGIN_DATA:-}"' \
+        _ "$ROOT_DIR/tests/lib/test-helpers.sh"
+)
+if [[ -z "$HELPER_DATA" ]]; then
+    log_fail "sourcing test-helpers.sh leaves CLAUDE_PLUGIN_DATA unset" \
+        "a test run outside the runner reads and writes the developer's real plugin data, so it means something different depending on how it was invoked"
+elif [[ "$HELPER_DATA" == "$HOME/.claude/plugins/data/craftsman" ]]; then
+    log_fail "test-helpers.sh points at the real plugin data directory" \
+        "got '$HELPER_DATA'"
+else
+    log_pass "sourcing test-helpers.sh isolates plugin data on its own ($HELPER_DATA)"
+fi
+
+# A Grok Bash tool exports GROK_SESSION_ID (1.0.34). host_detect reads it
+# before Claude/Codex marks, so an "unknown host" assertion names grok and
+# asks instead of denying. Same class as CLAUDE_CODE_SESSION_ID: strip here,
+# a test that wants a Grok identity sets the variable itself.
+GROK_LEAK=$(
+    GROK_SESSION_ID=leaked GROK_AGENT=1 env -u _TEST_HELPERS_LOADED bash -c \
+        'source "$1" >/dev/null 2>&1; printf "%s" "${GROK_SESSION_ID-UNSET}"' \
+        _ "$ROOT_DIR/tests/lib/test-helpers.sh"
+)
+if [[ "$GROK_LEAK" == "UNSET" || -z "$GROK_LEAK" ]]; then
+    log_pass "sourcing test-helpers.sh unsets GROK_SESSION_ID"
+else
+    log_fail "sourcing test-helpers.sh leaves GROK_SESSION_ID set" \
+        "got '$GROK_LEAK'; unknown-host assertions then ask instead of deny"
+fi
+
+# CR-204 F10: a test whose cd fails stops, and no test commits in the
+# repository it lives in. Witnessed on a throwaway repository that carries a
+# copy of the helpers, so a guard that fails costs nothing real.
+GUARD_REPO=$(mktemp -d "${TMPDIR:-/tmp}/craftsman-guard.XXXXXX") || exit 1
+mkdir -p "$GUARD_REPO/tests/lib"
+cp "$ROOT_DIR/tests/lib/test-helpers.sh" "$GUARD_REPO/tests/lib/"; mkdir -p "$GUARD_REPO/hooks"; cp -R "$ROOT_DIR/hooks/lib" "$GUARD_REPO/hooks/"
+command git -C "$GUARD_REPO" init -q && command git -C "$GUARD_REPO" add -A && command git -C "$GUARD_REPO" commit -qm base
+GUARD_HEAD=$(command git -C "$GUARD_REPO" rev-parse HEAD)
+GUARD_OUT=$(builtin cd "$GUARD_REPO" && bash -c 'source tests/lib/test-helpers.sh; cd /nonexistent-craftsman-dir; echo REACHED > canary.txt; git add -A; git commit -qm add' 2>&1; echo "rc=$?")
+if [[ "$GUARD_OUT" == *"rc=97"* && ! -e "$GUARD_REPO/canary.txt" && "$(command git -C "$GUARD_REPO" rev-parse HEAD)" == "$GUARD_HEAD" ]]; then
+    log_pass "a failed cd inside the repository stops the test before it writes or commits there"
+else
+    log_fail "failed cd guard" "$(printf '%s' "$GUARD_OUT" | tr '\n' ' ' | cut -c1-160)"
+fi
+GUARD_OUT=$(builtin cd "$GUARD_REPO" && bash -c 'source tests/lib/test-helpers.sh; git commit -q --allow-empty -m add' 2>&1; echo "rc=$?")
+if [[ "$GUARD_OUT" == *"rc=97"* && "$(command git -C "$GUARD_REPO" rev-parse HEAD)" == "$GUARD_HEAD" ]]; then
+    log_pass "a git commit inside the repository the helpers live in is refused"
+else
+    log_fail "git write guard" "$(printf '%s' "$GUARD_OUT" | tr '\n' ' ' | cut -c1-160)"
+fi
+rm -rf "$GUARD_REPO"
+
+if [[ "${CRAFTSMAN_ISOLATION_AUDIT:-0}" != "1" ]]; then
+    echo ""
+    echo "Suite isolation audit skipped (costs a full suite run)."
+    echo "Run it with: CRAFTSMAN_ISOLATION_AUDIT=1 bash tests/core/test-suite-isolation.sh"
+    test_summary
+fi
+
+echo ""
+echo "=== Every subtest leaves the checkout and ~/.claude as it found them ==="
+
+# The same list the runner uses, read from the runner so the two cannot drift.
+# Read in a loop rather than with mapfile: mapfile is bash 4+, and stock macOS
+# ships bash 3.2, which is the platform this audit most needs to run on.
+SUBTESTS=()
+while IFS= read -r subtest; do
+    [[ -n "$subtest" ]] && SUBTESTS+=("$subtest")
+done < <(
+    grep -oE 'run_subtest "[^"]+" "\$SCRIPT_DIR/[^"]+"' "$ROOT_DIR/tests/run-tests.sh" \
+        | sed 's/.*\$SCRIPT_DIR\///; s/"$//'
+)
+
+if [[ ${#SUBTESTS[@]} -eq 0 ]]; then
+    log_fail "no subtest found in run-tests.sh" \
+        "the audit below would pass without running anything"
+    test_summary
+fi
+log_pass "found ${#SUBTESTS[@]} subtest(s) to audit"
+
+# A signature of everything a subtest could plausibly disturb: the working
+# tree as git sees it, and the top level of ~/.claude.
+state_signature() {
+    git -C "$ROOT_DIR" status --porcelain
+    echo "---"
+    find "${HOME}/.claude" -maxdepth 1 -type f -exec sh -c \
+        'printf "%s %s\n" "$(shasum -a 256 "$1" | cut -d" " -f1)" "$1"' _ {} \; 2>/dev/null | sort
+    echo "---"
+    # The metrics databases live four levels down, so the maxdepth 1 sweep
+    # above never saw them. That is how this audit reported every subtest
+    # clean while the suite was writing its fixtures into production metrics.
+    find "${HOME}/.claude/plugins/data" -name '*.db' -exec sh -c \
+        'printf "%s %s\n" "$(shasum -a 256 "$1" | cut -d" " -f1)" "$1"' _ {} \; 2>/dev/null | sort
+}
+
+OFFENDERS=()
+for rel in "${SUBTESTS[@]}"; do
+    script="$ROOT_DIR/tests/$rel"
+    [[ -f "$script" ]] || continue
+
+    before=$(state_signature)
+    bash "$script" >/dev/null 2>&1
+    after=$(state_signature)
+
+    if [[ "$before" == "$after" ]]; then
+        log_pass "$rel leaves no trace"
+    else
+        OFFENDERS+=("$rel")
+        log_fail "$rel mutates shared state" \
+            "$(diff <(printf '%s' "$before") <(printf '%s' "$after") | head -6 | tr '\n' ' ')"
+    fi
+done
+
+echo ""
+if [[ ${#OFFENDERS[@]} -eq 0 ]]; then
+    echo "No subtest mutates shared state: the suite's result cannot depend on order."
+else
+    echo "Order-dependent surface: ${OFFENDERS[*]}"
+fi
+
+test_summary

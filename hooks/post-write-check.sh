@@ -1,0 +1,791 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Post-Write/Edit Validation Hook for Claude Code
+# Validates written or edited files against craftsman coding standards.
+#
+# TRIGGERS: PostToolUse for Write and Edit tools, and for Bash when the host
+#           lists the files the command changed (tool_response.bashEditDiff)
+# EXIT CODES: 0 = pass (or warning), 2 = blocking violation
+# OUTPUT: JSON with hookSpecificOutput or systemMessage
+#
+# Three validation levels:
+#   Level 1: Regex (always, <50ms) - strict_types, final, any, setters
+#   Level 2: Static analysis (if tools installed, <2s) - PHPStan, ESLint
+#   Level 3: Architecture (if tools installed, <2s) - deptrac, dependency-cruiser
+# craftsman-ignore: SH001
+# =============================================================================
+set -uo pipefail
+
+# Fail-open trap: if hook crashes, pass instead of blocking all writes
+trap 'echo "WARNING: post-write-check.sh failed at line $LINENO" >&2; exit 0' ERR
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INPUT=$(cat)
+
+# A shell command writes files too, and the host's write tools never see them
+# (docs/reference/hooks.md). Claude Code 2.1.269+ lists what a Bash command
+# changed in tool_response.bashEditDiff.changedFiles when recording is on
+# (bypass or auto mode, or `bashEditDiffEnabled`; captured on 2.1.304,
+# tests/fixtures/hosts/PROVENANCE.md). This hook runs after every Bash call,
+# so a command that changed nothing leaves here, before anything is loaded.
+# The host documents the list as best effort: it decides what is reviewed,
+# and the verdict goes back to Claude like a Write's.
+TOOL_NAME=$(printf '%s' "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null)
+SHELL_WRITES=""
+if [[ "$TOOL_NAME" == "Bash" ]]; then
+    SHELL_WRITES=$(printf '%s' "$INPUT" | jq -r '.tool_response.bashEditDiff.changedFiles // [] | .[]' 2>/dev/null)
+    [[ -n "$SHELL_WRITES" ]] || exit 0
+fi
+source "${SCRIPT_DIR}/lib/session-files.sh"
+session_files_bind "$INPUT"
+
+# Load helpers
+source "${SCRIPT_DIR}/lib/metrics-db.sh"
+source "${SCRIPT_DIR}/lib/static-analysis.sh"
+source "${SCRIPT_DIR}/lib/precedence.sh"
+source "${SCRIPT_DIR}/lib/config.sh"
+source "${SCRIPT_DIR}/lib/rules-engine.sh"
+source "${SCRIPT_DIR}/lib/pack-loader.sh"
+source "${SCRIPT_DIR}/lib/structural.sh"
+rules_init "$PWD" "$(rules_global_dir)"
+
+# Python3 availability - skip correction learning features if missing
+HAS_PYTHON3=true
+command -v python3 >/dev/null 2>&1 || HAS_PYTHON3=false
+
+# Session state for correction learning
+SESSION_STATE=""
+
+# The blocked rule ids of this write, as a JSON array.
+# One entry per rule, however many lines it fired on: TS001 and PHP003 report
+# once per offending line, and keeping every occurrence put ['TS001','TS001']
+# in the pending set, so one fix wrote two verdicts and every count built on
+# corrections was inflated by the line count.
+_blocked_rules_json() {
+    local rules_json="[" first=true line r seen=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        r="${line%%:*}"
+        case " $seen " in *" $r "*) continue ;; esac
+        seen="$seen $r"
+        if [[ "$first" == true ]]; then
+            rules_json="${rules_json}\"${r}\""
+            first=false
+        else
+            rules_json="${rules_json},\"${r}\""
+        fi
+    done <<< "$(echo -e "$CRITICAL_VIOLATIONS")"
+    printf '%s]' "$rules_json"
+}
+
+# The key a file's pending verdicts sit under: the exact file, never its
+# directory glob. Keyed on `metrics_file_pattern` (src/Domain/**/*.php), the
+# pending list was shared by every file under the glob and never cleared, so
+# every later write to ANY of them re-recorded the same outcome: measured on
+# a production database, PHP002 carried 106 `ignored` rows from one pattern
+# against 56 blocking findings, and 5 of 10 rules had more outcomes than
+# findings (#68). One finding, at most one verdict.
+_pending_key() {
+    local file="$1" resolved
+    resolved=$(cd "$(dirname "$file")" 2>/dev/null && pwd -P) || resolved="$(dirname "$file")"
+    printf '%s/%s' "$resolved" "$(basename "$file")"
+}
+
+# Replace the file's pending verdicts with what THIS write still violates,
+# on every write. A rule that dropped out was answered by _check_corrections
+# just before, once; a clean write clears the key. The cross-file patterns
+# come back from the same interpreter start, read from the state it just
+# wrote: the detection that followed used to be a second start re-reading
+# the same file.
+_settle_session_state() {
+    $HAS_PYTHON3 || return 0
+    [[ -n "$SESSION_STATE" ]] || return 0
+    local file="$1"
+    mkdir -p "$(dirname "$SESSION_STATE")"
+
+    # Extract directory bucket for cross-file pattern grouping
+    local dir_bucket rules_json
+    dir_bucket=$(dirname "$file" | sed -E "s|${PWD}/||")
+    rules_json=$(_blocked_rules_json)
+
+    RECORDED_PATTERNS=$(python3 "$SCRIPT_DIR/lib/session_state.py" record-violation \
+        "$SESSION_STATE" "$(_pending_key "$file")" "$dir_bucket" "$rules_json" --detect 2>&1) \
+        && RECORDED_PATTERNS_FRESH=true \
+        || { echo "WARNING: session state write failed" >&2; RECORDED_PATTERNS=""; }
+}
+RECORDED_PATTERNS=""
+RECORDED_PATTERNS_FRESH=false
+
+# Detect cross-file patterns: same rule in 3+ files → suggest project-wide fix
+#
+# Filtered through the rules engine on the way out, like every other emitter.
+# The suggestion names a rule id, so the developer reads it as a verdict, and
+# the pattern state outlives both the session and the configuration that filled
+# it: a rule switched to `ignore` today kept being reported from violations
+# recorded while it was `block`. An explicit ignore is an instruction, not a
+# preference, and this was the one channel that walked around it.
+_detect_cross_file_patterns() {
+    $HAS_PYTHON3 || return 0
+    [[ ! -f "$SESSION_STATE" ]] && return
+
+    local raw
+    if $RECORDED_PATTERNS_FRESH; then
+        raw="$RECORDED_PATTERNS"
+    else
+        raw=$(python3 "$SCRIPT_DIR/lib/session_state.py" detect-patterns "$SESSION_STATE" 2>&1) \
+            || { echo "WARNING: cross-file pattern detection failed" >&2; return 0; }
+    fi
+
+    local line rule
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        rule=$(echo "$line" | cut -d: -f2)
+        [[ "$(rules_severity_for_file "$FILE_PATH" "$rule")" == "ignore" ]] && continue
+        printf '%s\n' "$line"
+    done <<< "$raw"
+}
+
+_check_corrections() {
+    $HAS_PYTHON3 || return 0
+    local file="$1"
+    local file_pattern
+    file_pattern=$(metrics_file_pattern "$file")
+
+    [[ ! -f "$SESSION_STATE" ]] && return
+
+    local prev_rules
+    prev_rules=$(python3 "$SCRIPT_DIR/lib/session_state.py" get-previous-violations \
+        "$SESSION_STATE" "$(_pending_key "$file")" 2>/dev/null) || return
+
+    [[ -z "$prev_rules" ]] && return
+    PENDING_BEFORE="$prev_rules"
+
+    local outcome
+    for prev_rule in $prev_rules; do
+        if echo -e "$CRITICAL_VIOLATIONS" | grep -q "^${prev_rule}:"; then
+            continue # Still violated, no verdict yet
+        fi
+        outcome=$(_correction_outcome "$file" "$prev_rule")
+        metrics_record_correction "$prev_rule" "$file_pattern" "${outcome%%|*}" "${outcome#*|}" "$file" 2>/dev/null || true
+    done
+}
+
+# _correction_outcome <file> <rule>: "action|context" for a rule that was
+# blocking on the previous write and is not on this one.
+#
+# It used to be `fixed` whatever made the rule go. When what changed is the
+# rule's SCOPE and not the code (a directory .craft-rules.yml demoting it, a
+# baseline mark holding it), the developer said "this rule is wrong here",
+# and the loop counted a fix and proposed to teach it: three such files made
+# a candidate. Resolve first, conclude after. `scoped` and `overridden` are
+# what the instinct gate reads as rejection and the acceptance report keeps
+# apart from a verdict on the finding.
+_correction_outcome() {
+    local file="$1" rule="$2" severity verdict
+    if file_has_ignore "$rule" 2>/dev/null; then
+        # A suppression that carries a reason in the grammar the block
+        # message offered, `(wrong: why)` or `(debt: why)`, is the developer's
+        # verdict on the rule, written with the context in front of them;
+        # transcribed as such. A bare marker records no verdict: no guessing.
+        if verdict=$(metrics_ignore_verdict "$file" "$rule"); then
+            metrics_record_verdict "$rule" "${verdict%%|*}" "$file" "${verdict#*|}" inline 2>/dev/null || true
+        fi
+        echo "ignored|craftsman-ignore added"
+        return
+    fi
+    severity=$(rules_severity_for_file "$file" "$rule" 2>/dev/null || echo block)
+    if [[ "$severity" != "block" ]]; then
+        echo "scoped|severity resolved to ${severity} for this file"
+    elif printf '%s' "$BASELINE_HELD" | grep -q "^${rule}$"; then
+        echo "overridden|held by the baseline mark"
+    else
+        echo "fixed|"
+    fi
+}
+
+# Init metrics DB (creates tables if needed, idempotent): one read when
+# SessionStart already migrated it (schema stamp, CR-278).
+metrics_init_once 2>/dev/null || true
+# The project root, once, in this shell: the pattern and the path of every
+# finding are asked for in subshells, which inherit it.
+metrics_project_resolve 2>/dev/null || true
+
+# Every finding on this write is inserted in ONE interpreter start, on exit,
+# whichever of the three exits below is taken (the ERR trap ends in `exit 0`,
+# which runs this too). Nothing below reads the violations table back within
+# the same run, so deferring the insert changes when the rows land and not what
+# any verdict says. The flush prints nothing: stdout is the hook's JSON.
+metrics_violations_queue_open
+trap 'metrics_violations_queue_flush 2>/dev/null' EXIT
+
+# Init pack loader (discovers and sources pack validators)
+pack_loader_init
+
+# Read tool input from stdin (JSON from the host)
+SESSION_STATE=$(session_file session-state.json)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)
+
+# A Codex apply_patch names its files inside `tool_input.command`, any number
+# of them, and has no `file_path`; reading that field alone validated nothing
+# after a patch landed (audit CR-117, C1). A shell command names none at all:
+# the host lists them (SHELL_WRITES above). Either way the files are on disk
+# by now, so each one is judged as the Write it amounts to: this script
+# re-runs itself once per written file with the same payload and the file
+# named, and the verdict is the strictest child's. The per-file logic below
+# stays the one path, and the metrics rows carry the same session and
+# tool_use ids. A listed file that is gone (a deletion) is skipped.
+PATCH_FILES=""
+if [[ -z "$FILE_PATH" && "$TOOL_NAME" == "apply_patch" ]]; then
+    LISTING=$(printf '%s' "$INPUT" | python3 "${SCRIPT_DIR}/lib/write_mirror.py" --list 2>/dev/null); LISTING_RC=$?
+    if [[ "$LISTING_RC" -ne 0 || "$LISTING" == UNREADABLE* ]]; then
+        # The write has landed and cannot be undone here; what can be said is
+        # that it was not validated, loudly (review F6).
+        echo "🚫 AI Craftsman could not read the patch that just landed (${LISTING#UNREADABLE	}); its files were NOT validated. Run the validation on them explicitly." >&2
+        exit 2
+    fi
+    PATCH_FILES=$(printf '%s' "$LISTING" | awk -F'\t' '$1 != "delete" {print (NF >= 3 ? $3 : $2)}')
+    [[ -z "$PATCH_FILES" ]] && exit 0
+fi
+[[ -n "$SHELL_WRITES" ]] && PATCH_FILES="$SHELL_WRITES"
+if [[ -n "$PATCH_FILES" ]]; then
+    CHILD_RC=0
+    CHILD_OUT=""
+    # One command or patch can change several files, and a child's verdict
+    # does not name its file: each one is printed under its path.
+    CHILD_ERR=$(mktemp "${TMPDIR:-/tmp}/craftsman-child-err.XXXXXX")
+    while IFS= read -r written; do
+        [[ -z "$written" || ! -f "$written" ]] && continue
+        rc=0
+        out=$(printf '%s' "$INPUT" | jq --arg fp "$written" '.tool_name = "Write" | .tool_input = {file_path: $fp}' \
+            | bash "$0" 2>"$CHILD_ERR") || rc=$?
+        [[ -s "$CHILD_ERR" ]] && { echo "${written}:"; cat "$CHILD_ERR"; } >&2
+        # 2 is a verdict; any other failure is a child that could not judge,
+        # and no verdict is not a clean verdict (review F6).
+        if [[ "$rc" -ne 0 && "$rc" -ne 2 ]]; then
+            echo "🚫 AI Craftsman could not validate ${written} after the write landed (exit ${rc})." >&2
+            CHILD_RC=2
+        fi
+        [[ "$rc" -eq 2 ]] && CHILD_RC=2
+        [[ -n "$out" ]] && CHILD_OUT="${CHILD_OUT}${out}"$'\n'
+    done <<< "$PATCH_FILES"
+    rm -f "$CHILD_ERR"
+    if [[ "$CHILD_RC" -eq 2 ]]; then
+        exit 2
+    fi
+    # One JSON object for the host: the children's messages, joined. The
+    # children print pretty JSON, so the stream is decoded object by object,
+    # not line by line (review F7).
+    [[ -n "$CHILD_OUT" ]] && printf '%s' "$CHILD_OUT" | python3 -c '
+import json, sys
+text = sys.stdin.read()
+decoder = json.JSONDecoder()
+bodies, at = [], 0
+while at < len(text):
+    while at < len(text) and text[at].isspace():
+        at += 1
+    if at >= len(text):
+        break
+    try:
+        obj, end = decoder.raw_decode(text, at)
+    except ValueError:
+        break
+    at = end
+    body = (obj.get("hookSpecificOutput") or {}).get("additionalContext") or obj.get("systemMessage")
+    if body:
+        bodies.append(body)
+if bodies:
+    text = "\n".join(bodies)
+    print(json.dumps({"systemMessage": text, "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}))
+'
+    exit 0
+fi
+
+# Refuse the characters that are dangerous where the path is interpolated,
+# rather than allow-listing an alphabet. The allowlist excluded [ ] ( ) + , and
+# everything non-ASCII, and a path it rejected skipped validation in silence:
+# every Next.js App Router dynamic route (app/[slug]/page.tsx) and route group
+# (app/(marketing)/page.tsx) was unvalidated, as was any path with an accent.
+# Verified beforehand that every downstream use of FILE_PATH is quoted, which
+# is what makes the narrower set sufficient.
+if [[ "$FILE_PATH" == *[\$\`\;\|\&\<\>\\\"\']* || "$FILE_PATH" == *$'\n'* ]]; then
+    echo "craftsman: not validating ${FILE_PATH}, the path contains a shell metacharacter" >&2
+    exit 0
+fi
+
+# Exit silently if no file path or file doesn't exist
+[[ -z "$FILE_PATH" || ! -f "$FILE_PATH" ]] && exit 0
+
+# Write/Edit exposure log: one line per validated write, the path written.
+# session-metrics.sh counts the lines at SessionEnd into sessions.writes_count
+# and task-completed-verify.sh counts them as evidence of work; the Stop-time
+# Sentry hook reads the paths, since a Stop payload names no file (audit
+# CR-117, C11). Append is atomic enough for hook concurrency; no locking.
+if [[ -n "$SESSION_STATE" ]]; then
+    printf '%s\n' "$FILE_PATH" >> "$(session_file session-writes)" 2>/dev/null || true
+fi
+
+# Get file extension
+EXT="${FILE_PATH##*.}"
+FILE_PATTERN=$(metrics_file_pattern "$FILE_PATH")
+
+# Violation accumulators
+CRITICAL_VIOLATIONS=""
+# Rules the baseline mark held on THIS write, one per line: read by
+# _correction_outcome, which must not ask the mark a second time (the lookup
+# counts occurrences per run, and the emit site consumed this one).
+BASELINE_HELD=""
+CRITICAL_COUNT=0
+WARNING_VIOLATIONS=""
+WARNING_COUNT=0
+
+# =============================================================================
+# craftsman-ignore support (single rule and multi-rule: PHP001, TS001, LAYER001)
+# =============================================================================
+# A rule the manifest declared never_ignorable (SEC*) is not silenced by any
+# marker, on this front-end or the others: a secret with a comment beside it
+# is still a secret on disk.
+_rule_marker_honoured() {
+    ! { type rule_never_ignorable >/dev/null 2>&1 && rule_never_ignorable "$1"; }
+}
+
+line_has_ignore() {
+    local line="$1"
+    local rule="$2"
+    _rule_marker_honoured "$rule" || return 1
+    # Multi-rule or single rule: "craftsman-ignore: PHP001, TS001, LAYER001"
+    # Check if the specific rule appears in the comma-separated list
+    if echo "$line" | grep -qE "craftsman-ignore:\s*[^#]*\b${rule}\b" 2>/dev/null; then
+        return 0
+    fi
+    # Blanket ignore (no specific rule - just "craftsman-ignore" with no colon or empty list)
+    if echo "$line" | grep -qE "craftsman-ignore\s*$" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+file_has_ignore() {
+    local rule="$1"
+    _rule_marker_honoured "$rule" || return 1
+    # Multi-rule or single rule anywhere in the file
+    if grep -qE "craftsman-ignore:\s*[^#]*\b${rule}\b" "$FILE_PATH" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+_record_violation_output() {
+    local rule="$1"
+    local message="$2"
+    local severity="$3"
+
+    if [[ "$severity" == "block" ]]; then
+        CRITICAL_VIOLATIONS="${CRITICAL_VIOLATIONS}${rule}: ${message}\n"
+        ((CRITICAL_COUNT++)) || true
+    else
+        WARNING_VIOLATIONS="${WARNING_VIOLATIONS}${rule}: ${message}\n"
+        ((WARNING_COUNT++)) || true
+    fi
+}
+
+# Record one violation to the metrics DB.
+#
+# `blocked` must mean blocked. It was $((1 - ignored)) - independent of
+# severity - so advisory rules recorded blocked=1 and the dashboard reported
+# 100% blocking for rules that never stop a write. `ignored` already carries
+# suppression; the two are separate facts.
+_record_violation_metric() {
+    local rule="$1" severity="$2" ignored="$3"
+
+    local metric_severity="critical"
+    [[ "$severity" == "warn" ]] && metric_severity="warning"
+
+    local metric_blocked=0
+    [[ "$severity" == "block" && "$ignored" -eq 0 ]] && metric_blocked=1
+
+    # The exact file too, not only its directory bucket: it is the only join
+    # key that can answer "did the other layer see THIS file".
+    metrics_record_violation "$rule" "$FILE_PATTERN" "$metric_severity" \
+        "$metric_blocked" "$ignored" "$FILE_PATH" 2>/dev/null || true
+}
+
+# The single funnel every violation passes through, Level 1 and Level 2/3
+# alike, which is why level precedence is arbitrated here and in no validator.
+#
+# A rule a higher level claims is HELD, not dropped: precedence_flush emits it
+# at the end of the run unless that higher level actually produced a verdict
+# for it. Severity is resolved on the way out, not here, because a finding that
+# never comes back has no verdict to resolve and one that does must get the
+# same resolution as any other.
+# Debt the file already carried at its mark is reported, never blocked.
+#
+# Without this, on a codebase with three years of history the first edit to
+# nearly every file is refused for code the user did not write, and the
+# rational response is to relax every rule, after which the plugin enforces
+# nothing at all. Measured on a real Symfony application, 400 files sampled:
+# 98% have no declare(strict_types=1), 88% are not final.
+#
+# The finding still prints. A gate that hides the debt lies about the state of
+# the file; one that blocks on it cannot be used; reporting without blocking is
+# neither. An already-advisory finding is left alone: there is nothing to
+# demote, and rewriting its message would say "not blocking" about something
+# that never blocked.
+# Every Level 1 finding the validators produced on this write, one line per
+# occurrence, whatever severity it resolves to and whether or not a mark holds
+# it. Tallied before precedence, so a finding an analyser answers for still
+# counts as observed; skipped during the analysers' turn and the flush, which
+# re-enter this funnel with what was already tallied. Read once, on a green
+# pass, to tighten the file's rule counts to what the pass saw.
+RULES_OBSERVED=""
+
+add_violation() {
+    local rule="$1"
+    local message="$2"
+    local file_path="${3:-$FILE_PATH}"
+    local ignored=0
+
+    [[ "${_PRECEDENCE_HIGHER_LEVEL:-0}" != "1" ]] && RULES_OBSERVED="${RULES_OBSERVED}${rule}"$'\n'
+
+    if precedence_defers "$rule" "$file_path"; then
+        precedence_hold "$rule" "$file_path" "0" "$message"
+        return
+    fi
+
+    local severity
+    severity=$(rules_severity_for_file "$file_path" "$rule")
+    [[ "$severity" == "ignore" ]] && return
+
+    file_has_ignore "$rule" && ignored=1
+
+    if rules_baseline_holds "$file_path" "$rule" "$severity"; then
+        severity="warn"; message="${message} (already present at the baseline, not blocking)"
+        BASELINE_HELD="${BASELINE_HELD}${rule}"$'\n'
+    fi
+    if [[ $ignored -eq 0 ]]; then
+        _record_violation_output "$rule" "$message" "$severity"
+    fi
+
+    _record_violation_metric "$rule" "$severity" "$ignored"
+}
+
+# A validator calling add_warning is stating an intent, not a verdict. The
+# verdict is the rules engine's, exactly as it is for add_violation: the rule's
+# advisory default is its `default_severity` in the manifest that owns it, and
+# .craft-config.yml or a directory .craft-rules.yml can promote it to block or
+# silence it.
+#
+# This used to write straight to WARNING_VIOLATIONS, bypassing severity
+# resolution and craftsman-ignore alike. SH001 was declared a blocking rule in
+# ci/doctrine-export.sh and emitted here as a warning, and no configuration in
+# either direction could reach it.
+add_warning() {
+    add_violation "$@"
+}
+
+# Authority: a user directive outranks a deterministic rule, which outranks a
+# learned instinct, which outranks a model judgment (ADR-0030 follow-up).
+#
+# Three of the four tiers are enforced right here and tested in
+# tests/core/test-authority.sh: rules_severity_for_file runs before anything is
+# emitted, so a rule the user set to ignore reaches no tier at all, and an
+# advisory verdict never raises the exit code.
+#
+# The fourth tier has no implementation ON PURPOSE. A semantic judgment must
+# enter through a path with no wiring to CRITICAL_VIOLATIONS, so that no
+# manifest, .craft-config.yml or later refactor can promote it into a blocking
+# verdict. That function was written and then removed: it had no caller, since
+# instincts are surfaced at SessionStart and the model tier waits on the
+# evaluation harness. Shipping the seam before the tier is speculative
+# generality, and doctrine does not rot the way unused code does. Whoever wires
+# the model tier writes that path then, and the constraint is recorded here and
+# in the ADR rather than in a function nobody calls.
+
+# The two callbacks precedence_flush calls at the end of the run.
+#
+# A flushed finding re-enters add_violation, so it is resolved, suppressed and
+# recorded exactly like any other. The higher level is out of the picture by
+# then, which is what makes the second pass terminate.
+precedence_emit() {
+    add_violation "$1" "$4" "$2"
+}
+
+# A held finding the higher level answered for is still a defect this gate saw.
+# Returning silently would leave no trace of it anywhere, and the correction
+# learning reads absence as "the developer fixed it" - it would learn from a
+# rule that merely changed owner. `overridden` is the correction table's own
+# word for a verdict another authority settled.
+precedence_note_superseded() {
+    local rule="$1" pattern
+    pattern=$(metrics_file_pattern "$2")
+    if declare -F metrics_record_correction >/dev/null 2>&1; then
+        metrics_record_correction "$rule" "$pattern" "overridden" \
+            "level 2/3 answered for this rule" "$2" 2>/dev/null || true
+    fi
+}
+
+# =============================================================================
+# Static Analysis Helper - parses structured CODE:LINE:MESSAGE output
+# =============================================================================
+_run_static_analysis() {
+    local file="$1"
+    local errors
+    errors=$(sa_analyze_file "$file" 2>/dev/null) || true
+    [[ -z "$errors" ]] && return
+
+    # Level 2/3 emits directly: never held, never superseded, not even by a
+    # manifest that names the analyser as owner of the analyser's own codes.
+    precedence_higher_level_begin
+    while IFS= read -r err_line; do
+        _apply_static_analysis_line "$err_line"
+    done <<< "$errors"
+    precedence_higher_level_end
+}
+
+# One line of an analyser's result: a coverage record or a finding. A clean
+# run answers too, and its coverage arrives as a record because nothing the
+# adapter declared inside its own subshell survives it.
+_apply_static_analysis_line() {
+    local err_line="$1" sa_code sa_lineno sa_msg
+    [[ -z "$err_line" ]] && return
+    case "$err_line" in
+        "$SA_COVERED_RECORD"*)
+            precedence_declare_covered "${err_line#"$SA_COVERED_RECORD"}"
+            return ;;
+    esac
+    sa_code=$(echo "$err_line" | cut -d: -f1)
+    sa_lineno=$(echo "$err_line" | cut -d: -f2)
+    sa_msg=$(echo "$err_line" | cut -d: -f3-)
+    sa_msg="${sa_msg#"${sa_msg%%[![:space:]]*}"}"
+    # A verdict on a code is the higher level answering for that code.
+    precedence_declare_covered "$sa_code"
+    if [[ -n "$sa_lineno" && "$sa_lineno" -gt 0 ]] 2>/dev/null; then
+        add_warning "${sa_code}" "line ${sa_lineno}: ${sa_msg}"
+    else
+        add_warning "${sa_code}" "${sa_msg}"
+    fi
+}
+
+# =============================================================================
+# Run Validation - delegates to pack validators
+# =============================================================================
+
+# One call, whatever the language. The list of extensions, the validators to
+# run and whether the language is enabled at all now come from the loaded
+# packs' manifests. The literal case statement this replaces was duplicated
+# across ten sites with no parity test, so a pack contributing a language the
+# engine had not been taught about loaded successfully and validated nothing.
+precedence_reset
+pack_dispatch_file "$FILE_PATH"
+
+# Level 2/3 runs only for a language whose pack declared a static_analysis
+# tool. Deriving it from "the language is known" would have started running
+# ESLint on .js the moment JavaScript was claimed for custom rules.
+#
+# sa_language_has_analyser memoises that lookup, which the precedence resolver
+# needs too: it was an awk fork answered twice, ten lines apart, per edit.
+_PWC_LANG=$(lang_for_file "$FILE_PATH")
+if sa_language_has_analyser "$_PWC_LANG"; then
+    _run_static_analysis "$FILE_PATH"
+fi
+
+# =============================================================================
+# Custom Rules Validation (from .craft-config.yml rules section): the engine's
+# one pass, the same pre-write and CI run (CR-171)
+# =============================================================================
+rules_check_custom "$FILE_PATH" "$_PWC_LANG"
+
+# =============================================================================
+# Structural ratchet (ADR-0025): a touched file may improve or stay equal,
+# never regress. Inert until the project opts in via `ratchet.py init`.
+# =============================================================================
+# Anchored on the FILE, the way the rule baseline is: the mark is the one
+# above the file, not the one in the shell's directory. Gated on `$PWD`, a
+# hook fired from a subdirectory of a marked project skipped the ratchet.
+if command -v python3 >/dev/null 2>&1 && rule_baseline_marked "$FILE_PATH"; then
+    # Capture with an explicit || branch: a non-zero exit inside a command
+    # substitution would otherwise fire the fail-open ERR trap before we can
+    # read the status, silently skipping the whole check.
+    RATCHET_EXIT=0
+    RATCHET_OUT=$(python3 "${SCRIPT_DIR}/lib/ratchet.py" check "$FILE_PATH" 2>/dev/null) || RATCHET_EXIT=$?
+    if [[ $RATCHET_EXIT -eq 1 && -n "$RATCHET_OUT" ]]; then
+        while IFS= read -r ratchet_line; do
+            [[ -z "$ratchet_line" ]] && continue
+            add_violation "RATCHET001" "structural regression: ${ratchet_line#RATCHET001 }"
+        done <<< "$RATCHET_OUT"
+    elif [[ $RATCHET_EXIT -eq 0 ]]; then
+        python3 "${SCRIPT_DIR}/lib/ratchet.py" update "$FILE_PATH" >/dev/null 2>&1 || true
+        # The same pass, the same direction, for the rule half of the row: a
+        # count only ever goes down to what this pass observed. Written once
+        # by `craftsman-ci baseline` and never moved, the counts kept holding
+        # debt that had been paid, and the same debt coming back was reported
+        # as inherited on the very write the ratchet refused as a regression.
+        # The registry names the Level 1 rules, the ones a pass evaluates in
+        # full; a clean write reaches this point without any rule lookup, so
+        # it is made ready here rather than assumed.
+        _rules_observed_args=()
+        while IFS= read -r _observed_line; do
+            [[ -z "$_observed_line" ]] && continue
+            _rules_observed_args+=("${_observed_line##* }=${_observed_line%% *}")
+        done <<< "$(printf '%s' "$RULES_OBSERVED" | sort | uniq -c | awk '{print $1, $2}')"
+        if _rule_registry_ready; then
+            python3 "${SCRIPT_DIR}/lib/rule_baseline.py" tighten "$FILE_PATH" \
+                --registry "$_RULE_REGISTRY_FILE" \
+                ${_rules_observed_args[@]+"${_rules_observed_args[@]}"} >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+
+# Last emitter has run, so every finding a higher level claimed can now be
+# settled: answered for, or emitted after all. This has to come after the
+# ratchet, which is itself an emitter, or a held RATCHET001 would never be
+# flushed at all.
+precedence_flush
+
+# Corrections are read after the flush, not before. A rule the flush brings
+# back is still violated, and a check that ran first would have seen it absent
+# and recorded it as fixed - teaching the correction learning the opposite of
+# what happened.
+PENDING_BEFORE=""
+_check_corrections "$FILE_PATH"
+# Then the pending set is what this write still violates, empty included: a
+# verdict recorded above is not recorded again on the next write. A clean
+# write with nothing pending has nothing to settle, and pays no start for it.
+if [[ -n "$PENDING_BEFORE" || $CRITICAL_COUNT -gt 0 ]]; then
+    _settle_session_state "$FILE_PATH"
+fi
+
+# =============================================================================
+# Output Decision
+# =============================================================================
+
+if [[ $CRITICAL_COUNT -gt 0 ]]; then
+    # Rules engine already routed block vs warn - CRITICAL_VIOLATIONS only contains blocking rules
+    # Check for cross-file patterns and append actionable suggestion
+    PATTERN_SUGGESTIONS=$(_detect_cross_file_patterns 2>/dev/null) || true
+    pattern_msg=""
+    if [[ -n "$PATTERN_SUGGESTIONS" ]]; then
+        while IFS= read -r ps_line; do
+            [[ -z "$ps_line" ]] && continue
+            if [[ "$ps_line" == PATTERN:* ]]; then
+                ps_rule=$(echo "$ps_line" | cut -d: -f2)
+                ps_count=$(echo "$ps_line" | cut -d: -f3)
+                ps_way_out=" or global craftsman-ignore"
+                rule_never_ignorable "$ps_rule" && ps_way_out=""
+                pattern_msg="${pattern_msg}PROJECT-WIDE PATTERN: ${ps_rule} found in ${ps_count} - consider a project-wide fix${ps_way_out}.\n"
+            elif [[ "$ps_line" == DIR_PATTERN:* ]]; then
+                ps_rule=$(echo "$ps_line" | cut -d: -f2)
+                ps_dir=$(echo "$ps_line" | cut -d: -f3)
+                ps_count=$(echo "$ps_line" | cut -d: -f4)
+                pattern_msg="${pattern_msg}DIRECTORY PATTERN: ${ps_rule} in ${ps_dir}/ (${ps_count}) - apply fix directory-wide.\n"
+            fi
+        done <<< "$PATTERN_SUGGESTIONS"
+    fi
+
+    # Human-readable message on stderr (shown in Claude Code UI)
+    echo "🚫 BLOCKED by AI Craftsman - ${CRITICAL_COUNT} violation(s):" >&2
+    while IFS= read -r vline; do
+        [[ -n "$vline" ]] && echo "  ✗ $vline" >&2
+    done <<< "$(echo -e "$CRITICAL_VIOLATIONS")"
+    # Scoping is offered BEFORE silencing, and it is offered at all. This line
+    # used to name craftsman-ignore as the only way out, so a rule that was
+    # wrong for a whole directory got suppressed once per file instead of
+    # scoped once: 151 of PHP002's 153 recorded suppressions came from entity
+    # directories that one .craft-rules.yml line would have covered.
+    echo "Fix these, or scope the rule in $(dirname "$FILE_PATH")/.craft-rules.yml:" >&2
+    echo "  rules:" >&2
+    echo "    <RULE_ID>: warn" >&2
+    MARKER_ADVICE=$(rule_marker_advice "$(echo -e "$CRITICAL_VIOLATIONS")")
+    echo "$MARKER_ADVICE" >&2
+
+    # OKF doctrine pointer (ADR-0024): route the first blocked rule to the
+    # concept that explains it - deterministic frontmatter match, no index.
+    FIRST_RULE=$(echo -e "$CRITICAL_VIOLATIONS" | head -1 | cut -d: -f1)
+    if [[ -n "$FIRST_RULE" ]] && command -v python3 >/dev/null 2>&1; then
+        DOCTRINE=$(python3 "${SCRIPT_DIR}/lib/knowledge_lookup.py" \
+            "${CLAUDE_PLUGIN_ROOT:-$(dirname "$SCRIPT_DIR")}/knowledge" by-rule "$FIRST_RULE" 2>/dev/null | head -2)
+        if [[ -n "$DOCTRINE" ]]; then
+            echo "Doctrine (knowledge/):" >&2
+            echo "$DOCTRINE" | sed 's/^/  → /' >&2
+            # Guided mode: same exigency, maximum teaching. The gate explains
+            # itself at the moment of friction instead of assuming expertise.
+            if config_guided; then
+                DOCTRINE_TITLE=$(echo "$DOCTRINE" | head -1 | cut -f2)
+                DOCTRINE_ID=$(echo "$DOCTRINE" | head -1 | cut -f1)
+                echo "Why this matters: ${DOCTRINE_TITLE}. Fixing it now costs one edit; fixing it in six months costs an afternoon. Read: knowledge/${DOCTRINE_ID}.md" >&2
+            fi
+        fi
+    fi
+    if [[ -n "$pattern_msg" ]]; then
+        echo -e "$pattern_msg" >&2
+    fi
+
+    # Structured JSON on stdout (consumed by Claude AI)
+    jq -n --arg violations "$(echo -e "$CRITICAL_VIOLATIONS")" \
+           --arg count "$CRITICAL_COUNT" \
+           --arg patterns "$(echo -e "$pattern_msg")" \
+           --arg advice "$MARKER_ADVICE" \
+    '{
+        hookSpecificOutput: {
+            hookEventName: "PostToolUse",
+            additionalContext: ("BLOCKED: " + $count + " critical violation(s):\n" + $violations + "\nFix these before proceeding.\n" + $advice + (if $patterns != "" then "\n" + $patterns else "" end))
+        }
+    }'
+    exit 2
+fi
+
+if [[ $WARNING_COUNT -gt 0 ]]; then
+    # Append cross-file pattern suggestions to warnings too
+    PATTERN_SUGGESTIONS=$(_detect_cross_file_patterns 2>/dev/null) || true
+    pattern_msg=""
+    if [[ -n "$PATTERN_SUGGESTIONS" ]]; then
+        while IFS= read -r ps_line; do
+            [[ -z "$ps_line" ]] && continue
+            if [[ "$ps_line" == PATTERN:* ]]; then
+                ps_rule=$(echo "$ps_line" | cut -d: -f2)
+                ps_count=$(echo "$ps_line" | cut -d: -f3)
+                pattern_msg="${pattern_msg}PROJECT-WIDE PATTERN: ${ps_rule} found in ${ps_count} - consider a project-wide fix.\n"
+            elif [[ "$ps_line" == DIR_PATTERN:* ]]; then
+                ps_rule=$(echo "$ps_line" | cut -d: -f2)
+                ps_dir=$(echo "$ps_line" | cut -d: -f3)
+                ps_count=$(echo "$ps_line" | cut -d: -f4)
+                pattern_msg="${pattern_msg}DIRECTORY PATTERN: ${ps_rule} in ${ps_dir}/ (${ps_count}).\n"
+            fi
+        done <<< "$PATTERN_SUGGESTIONS"
+    fi
+
+    # systemMessage reaches the user, additionalContext reaches Claude. Warnings
+    # went out on systemMessage only, so the model saw every blocking violation
+    # and none of the advisory ones - including the whole structural family,
+    # which is advisory by design and therefore invisible to it.
+    # An advisory verdict used to carry no action at all: no fix path, no scope
+    # path, no way to silence it. That is why the advisory family produced 5624
+    # fires and zero recorded corrections in 30 days, in either direction. A
+    # warning nobody can act on is not a warning, it is noise that teaches the
+    # gate is optional.
+    # Built as a shell variable and passed through --arg: inlining it in the
+    # jq program would need single quotes, which close the program itself and
+    # turn <RULE_ID> into a shell redirect.
+    WARNING_ACTIONS="Act on each: fix it, or scope the rule where it does not apply"
+    WARNING_ACTIONS="${WARNING_ACTIONS} (in $(dirname "$FILE_PATH")/.craft-rules.yml, under a \"rules:\" key,"
+    WARNING_ACTIONS="${WARNING_ACTIONS} indented two spaces: \"<RULE_ID>: ignore\")."
+    WARNING_ACTIONS="${WARNING_ACTIONS} $(rule_marker_advice "$(echo -e "$WARNING_VIOLATIONS")" | tr '\n' ' ')"
+    WARNING_ACTIONS="${WARNING_ACTIONS}Leaving it unaddressed is the one outcome that teaches nothing."
+
+    jq -n --arg warnings "$(echo -e "$WARNING_VIOLATIONS")" \
+           --arg count "$WARNING_COUNT" \
+           --arg patterns "$(echo -e "$pattern_msg")" \
+           --arg actions "$WARNING_ACTIONS" \
+    '(("WARNINGS: " + $count + " issue(s) detected:\n" + $warnings
+       + (if $patterns != "" then "\n" + $patterns else "" end)
+       + "\n" + $actions)) as $body
+     | {
+        systemMessage: $body,
+        hookSpecificOutput: {
+            hookEventName: "PostToolUse",
+            additionalContext: $body
+        }
+    }'
+    exit 0
+fi
+
+exit 0

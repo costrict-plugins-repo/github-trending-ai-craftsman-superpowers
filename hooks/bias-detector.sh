@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Bias Detection Hook for Claude Code
+# Detects cognitive biases in prompts and displays non-blocking warnings.
+#
+# Reads the prompt, records session context and emits non-blocking warnings.
+# No network access.
+# =============================================================================
+set -uo pipefail
+
+# Non-blocking: if hook crashes, pass silently
+trap 'exit 0' ERR
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/session-files.sh"
+
+# Read the prompt from stdin (JSON format from Claude Code)
+INPUT=$(cat)
+session_files_bind "$INPUT"
+# Prompt hooks can recover a native binding when SessionStart was missed.
+[[ "$CRAFTSMAN_SESSION_HOST" == "grok" ]] && session_files_register
+SESSION_STATE=$(session_file session-state.json)
+PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty' 2>/dev/null || echo "$INPUT")
+
+# If we couldn't parse JSON, use the raw input
+if [[ -z "$PROMPT" ]]; then
+    PROMPT="$INPUT"
+fi
+
+# Exit early if no prompt
+[[ -z "$PROMPT" ]] && exit 0
+
+# =============================================================================
+# Bias Patterns - loaded from hooks/lib/bias-patterns/<lang>.conf (ADR-0030).
+# The detector knows the categories; the languages live in data.
+# =============================================================================
+
+LIB_DIR="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/hooks/lib"
+# shellcheck source=/dev/null
+source "$LIB_DIR/bias-registry.sh"
+bias_registry_init "${CRAFTSMAN_BIAS_PATTERNS_DIR:-$LIB_DIR/bias-patterns}"
+
+# =============================================================================
+# Detection & Warnings
+# =============================================================================
+
+WARNINGS=""
+
+add_warning() {
+    if [[ -n "$WARNINGS" ]]; then
+        WARNINGS="${WARNINGS} | $1"
+    else
+        WARNINGS="$1"
+    fi
+}
+
+warn_acceleration() {
+    add_warning "Acceleration bias: You may be rushing. Consider: What behavior is expected? Should we use /craftsman:design first? What test would verify this works?"
+}
+
+warn_scope_creep() {
+    add_warning "Scope Creep bias: Adding features beyond scope. Is this in the original requirement? Should this be a separate task? YAGNI."
+}
+
+warn_over_optimization() {
+    add_warning "Over-Optimization bias: Premature abstraction. Do we have 3+ use cases? Make it work first. Concrete code > complex abstraction."
+}
+
+warn_missing_design() {
+    add_warning "Workflow: Domain modeling without /craftsman:design. Run /craftsman:design to model the domain properly before creating entities."
+}
+
+SIGNAL_NOTES=""
+
+_signal_intent() {
+    case "$1" in
+        acceleration)     printf 'rushing past design and tests' ;;
+        scope_creep)      printf 'adding work beyond the current scope' ;;
+        over_optimization) printf 'abstracting or generalizing prematurely' ;;
+        domain_modeling)  printf 'modeling the domain without a design session' ;;
+    esac
+}
+
+add_signal_note() {
+    local slug="$1" lexeme="$2"
+    SIGNAL_NOTES="${SIGNAL_NOTES}- Bias signal (${slug}): lexeme \"${lexeme}\" suggests $(_signal_intent "$slug")."$'\n'
+}
+
+# This hook is the only UserPromptSubmit surface the plugin has, so it is where
+# the plugin learns that a design pass was asked for. The flag was read here
+# and written nowhere: the exemption below could never fire, and the README row
+# promising a design decision is caught described a branch no session reached.
+_record_design_pass() {
+    case "$PROMPT" in
+        */craftsman:design*|/craftsman:design*)
+            python3 "$LIB_DIR/session_state.py" merge "$SESSION_STATE" design_used true >/dev/null 2>&1 || true
+            ;;
+    esac
+}
+
+# Design-session predicate, shared by the curated and the signal domain-modeling
+# paths: both defer to /craftsman:design having already run.
+_design_was_used() {
+    local design_used=false
+    if [[ -f "$SESSION_STATE" ]]; then
+        design_used=$(python3 "$LIB_DIR/session_state.py" check-flag "$SESSION_STATE" design_used 2>/dev/null) || design_used=false
+    fi
+    [[ "$design_used" == "true" ]]
+}
+
+_record_design_pass
+
+# Reported speech is not an instruction.
+#
+# A prompt can NAME a bias without exhibiting it: "why does the bias detector
+# flag 'while we are at it'?", "the ticket says skip the tests, is that wise?",
+# "the client asked for maximum performance in the SLA". Each of those warned,
+# and a warning on an ordinary question costs more than a missed bias, because
+# the first teaches the user to ignore the hook. README.md and CLAUDE.md both
+# claim the detector "requires imperative verb context"; this is the part of
+# that claim which was never implemented.
+#
+# Deliberately narrow: it fires only on a verb of attribution, so "make it
+# configurable, we might need it later" still warns, question mark or not.
+# Per language, declared beside that language's patterns, because a verb of
+# attribution is a fact about a language and not about this file. A language
+# that declares none simply has no guard, which is the honest default: the
+# eleven unmeasured languages are not silently claimed to have one.
+_bias_reported_pattern() {
+    local combined="" tier
+    for tier in curated signal; do
+        local pattern
+        pattern=$(bias_combined_pattern REPORTED "$tier") || continue
+        if [[ -n "$combined" ]]; then
+            combined="${combined}|${pattern}"
+        else
+            combined="$pattern"
+        fi
+    done
+    [[ -z "$combined" ]] && return 1
+    printf '%s' "$combined"
+}
+
+_bias_is_reported() {
+    local pattern
+    pattern=$(_bias_reported_pattern) || return 1
+    grep -iEq "$pattern" <<< "$PROMPT"
+}
+
+# The prompt does not change during a run, so neither does the answer: asked
+# once here, not once per category (four greps and twelve subshells).
+BIAS_REPORTED=false
+_bias_is_reported && BIAS_REPORTED=true
+
+_bias_matches() {
+    [[ "$BIAS_REPORTED" == true ]] && return 1
+    grep -iEq "$1" <<< "$PROMPT"
+}
+
+# Check each curated category. bias_combined_pattern returns non-zero when no
+# language declares a category, and the grep MUST be skipped then: an empty
+# pattern matches every prompt.
+if pat=$(bias_combined_pattern ACCELERATION curated); then
+    _bias_matches "$pat" && warn_acceleration || true
+fi
+if pat=$(bias_combined_pattern SCOPE_CREEP curated); then
+    _bias_matches "$pat" && warn_scope_creep || true
+fi
+if pat=$(bias_combined_pattern OVER_OPT curated); then
+    _bias_matches "$pat" && warn_over_optimization || true
+fi
+
+# Workflow enforcement: warn if domain modeling without /craftsman:design
+if pat=$(bias_combined_pattern DOMAIN_MODELING curated) && grep -iEq "$pat" <<< "$PROMPT"; then
+    _design_was_used || warn_missing_design
+fi
+
+# Signal tier (ADR-0030): only when NO curated warning fired. A signal match
+# is not a verdict; the main model adjudicates it in context. Matching is
+# case-sensitive on purpose: signal patterns carry explicit case variants
+# because grep -i case folding is locale-dependent beyond ASCII.
+# The reported-speech guard applies to BOTH tiers. It sat on the curated path
+# alone, so English was protected and the twelve signal languages were not:
+# "le ticket dit qu'on saute les tests, c'est raisonnable ?" still produced a
+# note, which is the same false positive in another language.
+if [[ -z "$WARNINGS" && "$BIAS_REPORTED" != true ]]; then
+    for _cat_pair in "ACCELERATION acceleration" "SCOPE_CREEP scope_creep" \
+                     "OVER_OPT over_optimization" "DOMAIN_MODELING domain_modeling"; do
+        _cat="${_cat_pair%% *}"
+        _slug="${_cat_pair##* }"
+        pat=$(bias_combined_pattern "$_cat" signal) || continue
+        # First match of the first matching line, as `| head -1` had it,
+        # without the two extra processes per category.
+        _match=$(grep -m 1 -oE "$pat" <<< "$PROMPT" 2>/dev/null) || true
+        _match="${_match%%$'\n'*}"
+        [[ -z "$_match" ]] && continue
+        if [[ "$_slug" == "domain_modeling" ]] && _design_was_used; then
+            continue
+        fi
+        add_signal_note "$_slug" "$_match"
+    done
+fi
+
+# A context request left by a Stop-time hook (the Sentry request: a Stop has
+# no model-visible channel short of forcing a continuation) is handed to the
+# model here, once, and cleared.
+PENDING_CONTEXT=""
+if [[ -f "$SESSION_STATE" ]]; then
+    # Always a JSON string (agent-sentry-context.sh writes it through jq --arg),
+    # so jq reads it for a tenth of a Python start, on every prompt.
+    PENDING_CONTEXT=$(jq -r '.pending_context // empty' "$SESSION_STATE" 2>/dev/null || true)
+fi
+[[ -n "$PENDING_CONTEXT" ]] && python3 "${SCRIPT_DIR}/lib/session_state.py" merge "$SESSION_STATE" pending_context '""' >/dev/null 2>&1 || true
+
+# Exclusive output formats: stdout is parsed as ONE payload by UserPromptSubmit.
+# Curated verdicts ship as JSON (systemMessage, user-visible, today's behavior),
+# with the pending context as additionalContext, the model's channel. Signal
+# notes ship as plain stdout, the documented context channel the model sees;
+# they are emitted only when no curated warning fired at all.
+if [[ -n "$WARNINGS" ]]; then
+    jq -n --arg msg "$WARNINGS" --arg ctx "$PENDING_CONTEXT" '{
+        systemMessage: $msg
+    } + (if $ctx != "" then {hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: $ctx}} else {} end)'
+elif [[ -n "$SIGNAL_NOTES" || -n "$PENDING_CONTEXT" ]]; then
+    [[ -n "$PENDING_CONTEXT" ]] && printf '%s\n' "$PENDING_CONTEXT"
+    [[ -n "$SIGNAL_NOTES" ]] && printf '%s\n%s' \
+        "Bias signal from the prompt lexicon. The matcher has no conversation context; you have all of it. For each signal below: if it reflects the user's real intent, surface that discipline warning in their language; if the match is incidental (quoted text, descriptive use, topic discussion), ignore it silently and never mention this note." \
+        "$SIGNAL_NOTES"
+fi
+
+# Always exit 0 (warning only, never block)
+exit 0

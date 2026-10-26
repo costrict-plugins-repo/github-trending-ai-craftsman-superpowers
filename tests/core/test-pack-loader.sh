@@ -1,0 +1,657 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Pack Loader Tests
+# Tests pack-loader.sh: discovery, stack filtering, wildcard, validator delegation
+# =============================================================================
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+
+source "$SCRIPT_DIR/../lib/test-helpers.sh"
+
+source "$ROOT_DIR/hooks/lib/config.sh"
+source "$ROOT_DIR/hooks/lib/pack-loader.sh"
+
+# Fixture helper - creates a minimal pack in a temp packs dir
+TEST_PACKS_DIR="/tmp/craftsman-pack-loader-tests-$$"
+mkdir -p "$TEST_PACKS_DIR"
+
+# craftsman-ignore: SH002 - heredoc-heavy test fixture builder, splitting hurts readability
+_make_pack() {
+    local pack_name="$1"
+    local stack_line="$2"         # e.g. '["symfony", "fullstack"]' or '["*"]'
+    local scaffold_types="${3:-}"  # optional, e.g. 'entity'
+    local validator_fn="${4:-}"    # optional bash function body
+
+    local pack_dir="$TEST_PACKS_DIR/$pack_name"
+    mkdir -p "$pack_dir"
+
+    cat > "$pack_dir/pack.yml" <<YAML
+name: ${pack_name}
+version: "1.0.0"
+description: "Test pack ${pack_name}"
+compatibility:
+  core: ">=2.4.0"
+  stack: ${stack_line}
+
+hooks:
+  validators: ["hooks/validator.sh"]
+
+commands:
+  scaffold_types: [${scaffold_types}]
+YAML
+
+    mkdir -p "$pack_dir/hooks"
+    if [[ -n "$validator_fn" ]]; then
+        printf '%s\n' "#!/usr/bin/env bash" "$validator_fn" > "$pack_dir/hooks/validator.sh"
+    else
+        printf '%s\n' "#!/usr/bin/env bash" "# no-op validator" > "$pack_dir/hooks/validator.sh"
+    fi
+}
+
+# =============================================================================
+# 1. Pack discovery - matching stack is loaded
+# =============================================================================
+echo ""
+echo "=== Pack Discovery ==="
+
+_pack_reset
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+export CLAUDE_PLUGIN_OPTION_stack="symfony"
+
+_make_pack "test-symfony" '["symfony", "fullstack"]' '"entity"'
+pack_loader_init "$TEST_PACKS_DIR"
+
+loaded=$(pack_loaded)
+if echo "$loaded" | grep -q "test-symfony"; then
+    log_pass "test-symfony pack discovered when stack=symfony"
+else
+    log_fail "Pack discovery" "test-symfony not found in loaded packs: '$loaded'"
+fi
+
+# =============================================================================
+# 2. Stack compatibility filter - mismatched stack is skipped
+# =============================================================================
+echo ""
+echo "=== Stack Compatibility Filter ==="
+
+_pack_reset
+export CLAUDE_PLUGIN_OPTION_stack="symfony"
+
+_make_pack "test-react-only" '["react"]' '"component"'
+pack_loader_init "$TEST_PACKS_DIR"
+
+loaded=$(pack_loaded)
+if echo "$loaded" | grep -q "test-react-only"; then
+    log_fail "Stack filter" "test-react-only should NOT be loaded when stack=symfony, but was"
+else
+    log_pass "test-react-only skipped when stack=symfony (react-only pack filtered out)"
+fi
+
+# Symfony pack should still be there
+if echo "$loaded" | grep -q "test-symfony"; then
+    log_pass "test-symfony still loaded alongside filtered react pack"
+else
+    log_fail "test-symfony should still be loaded" "got: '$loaded'"
+fi
+
+# =============================================================================
+# 3. Wildcard stack - loads for any stack
+# =============================================================================
+echo ""
+echo "=== Wildcard Stack ==="
+
+_pack_reset
+export CLAUDE_PLUGIN_OPTION_stack="symfony"
+
+_make_pack "test-wildcard" '["*"]'
+pack_loader_init "$TEST_PACKS_DIR"
+
+loaded=$(pack_loaded)
+if echo "$loaded" | grep -q "test-wildcard"; then
+    log_pass "Wildcard pack loaded when stack=symfony"
+else
+    log_fail "Wildcard pack" "test-wildcard not loaded: '$loaded'"
+fi
+
+_pack_reset
+export CLAUDE_PLUGIN_OPTION_stack="react"
+pack_loader_init "$TEST_PACKS_DIR"
+
+loaded=$(pack_loaded)
+if echo "$loaded" | grep -q "test-wildcard"; then
+    log_pass "Wildcard pack loaded when stack=react"
+else
+    log_fail "Wildcard pack (react stack)" "test-wildcard not loaded: '$loaded'"
+fi
+
+# =============================================================================
+# 4. Validator delegation - pack_run_validators calls sourced function
+# =============================================================================
+echo ""
+echo "=== Validator Delegation ==="
+
+_pack_reset
+export CLAUDE_PLUGIN_OPTION_stack="symfony"
+
+VALIDATOR_CALLED=""
+_make_pack "test-validator" '["symfony"]' '' \
+    'pack_validate_php() { export VALIDATOR_CALLED="yes:$1"; }'
+
+pack_loader_init "$TEST_PACKS_DIR"
+pack_run_validators "/some/file.php" "php"
+
+if [[ "${VALIDATOR_CALLED:-}" == "yes:/some/file.php" ]]; then
+    log_pass "pack_run_validators delegated to pack_validate_php with correct file arg"
+else
+    log_fail "Validator delegation" "VALIDATOR_CALLED='${VALIDATOR_CALLED:-}', expected 'yes:/some/file.php'"
+fi
+
+# Verify no call for unknown lang
+VALIDATOR_CALLED=""
+pack_run_validators "/some/file.rb" "ruby"
+if [[ -z "${VALIDATOR_CALLED:-}" ]]; then
+    log_pass "pack_run_validators is a no-op for unknown lang (ruby)"
+else
+    log_fail "Unknown lang should be no-op" "VALIDATOR_CALLED='${VALIDATOR_CALLED}'"
+fi
+
+# =============================================================================
+# 5. pack_list_scaffold_types - returns pack_name:type per loaded pack
+# =============================================================================
+echo ""
+echo "=== Scaffold Types ==="
+
+_pack_reset
+export CLAUDE_PLUGIN_OPTION_stack="symfony"
+
+_make_pack "test-scaffold" '["symfony"]' '"entity", "usecase"'
+pack_loader_init "$TEST_PACKS_DIR"
+
+types=$(pack_list_scaffold_types)
+if echo "$types" | grep -q "test-scaffold:entity"; then
+    log_pass "Scaffold type 'entity' listed as test-scaffold:entity"
+else
+    log_fail "Scaffold types" "entity not found in: '$types'"
+fi
+if echo "$types" | grep -q "test-scaffold:usecase"; then
+    log_pass "Scaffold type 'usecase' listed as test-scaffold:usecase"
+else
+    log_fail "Scaffold types" "usecase not found in: '$types'"
+fi
+
+# =============================================================================
+# 6. pack_sync_symlinks - creates and cleans symlinks
+# =============================================================================
+echo ""
+echo "=== Symlink Sync ==="
+
+_pack_reset
+export CLAUDE_PLUGIN_OPTION_stack="symfony"
+
+SYMLINK_ROOT="/tmp/craftsman-symlink-test-$$"
+mkdir -p "$SYMLINK_ROOT/agents" "$SYMLINK_ROOT/skills"
+
+SYMLINK_PACK_DIR="$TEST_PACKS_DIR/test-symlink"
+mkdir -p "$SYMLINK_PACK_DIR/agents" "$SYMLINK_PACK_DIR/commands"
+cat > "$SYMLINK_PACK_DIR/pack.yml" <<YAML
+name: test-symlink
+version: "1.0.0"
+description: "Symlink test pack"
+compatibility:
+  core: ">=2.4.0"
+  stack: ["symfony"]
+hooks:
+  validators: []
+commands:
+  scaffold_types: []
+YAML
+touch "$SYMLINK_PACK_DIR/agents/my-agent.md"
+touch "$SYMLINK_PACK_DIR/commands/my-command.md"
+printf 'pack source\n' > "$SYMLINK_PACK_DIR/agents/shipped-agent.md"
+printf 'shipped copy\n' > "$SYMLINK_ROOT/agents/shipped-agent.md"
+
+# Create a stale symlink that should be cleaned
+ln -sf "/nonexistent/stale.md" "$SYMLINK_ROOT/agents/stale-agent.md"
+
+CLAUDE_PLUGIN_ROOT="$SYMLINK_ROOT" pack_loader_init "$TEST_PACKS_DIR"
+CLAUDE_PLUGIN_ROOT="$SYMLINK_ROOT" pack_sync_symlinks
+
+if [[ ! -L "$SYMLINK_ROOT/agents/shipped-agent.md" && "$(cat "$SYMLINK_ROOT/agents/shipped-agent.md")" == "shipped copy" ]]; then
+    log_pass "A shipped ordinary agent survives runtime pack synchronization"
+else
+    log_fail "Shipped agent preservation" "regular agent replaced during synchronization"
+fi
+
+if [[ -L "$SYMLINK_ROOT/agents/my-agent.md" ]]; then
+    log_pass "Symlink created for pack agent: my-agent.md"
+else
+    log_fail "Symlink creation" "agents/my-agent.md symlink missing"
+fi
+
+# A pack skill is a regular file, not a symlink: the Codex skill loader skips
+# a symlinked SKILL.md (measured with `codex debug prompt-input` on 0.154.0,
+# 19 of 22 skills listed), and every other host reads a plain file.
+printf -- '---\nname: my-command\n---\nv1\n' > "$SYMLINK_PACK_DIR/commands/my-command.md"
+CLAUDE_PLUGIN_ROOT="$SYMLINK_ROOT" pack_sync_symlinks
+if [[ -f "$SYMLINK_ROOT/skills/my-command/SKILL.md" && ! -L "$SYMLINK_ROOT/skills/my-command/SKILL.md" ]] \
+    && cmp -s "$SYMLINK_PACK_DIR/commands/my-command.md" "$SYMLINK_ROOT/skills/my-command/SKILL.md"; then
+    log_pass "Pack command materialised as a regular skills/my-command/SKILL.md identical to its source"
+else
+    log_fail "Skill materialisation" "skills/my-command/SKILL.md missing, a symlink, or diverging"
+fi
+if [[ -f "$SYMLINK_ROOT/skills/my-command/.craftsman-pack-source" ]]; then
+    log_pass "the copy carries a sidecar naming its pack source"
+else
+    log_fail "Skill sidecar" ".craftsman-pack-source missing"
+fi
+# The copy follows its source, and a symlink left by an older version is replaced.
+printf -- '---\nname: my-command\n---\nv2\n' > "$SYMLINK_PACK_DIR/commands/my-command.md"
+CLAUDE_PLUGIN_ROOT="$SYMLINK_ROOT" pack_sync_symlinks
+if grep -q '^v2$' "$SYMLINK_ROOT/skills/my-command/SKILL.md"; then
+    log_pass "a changed pack command refreshes the copy on the next sync"
+else
+    log_fail "Skill refresh" "copy still holds the old content"
+fi
+# A sync with nothing to change leaves the copy where it is. It used to delete
+# every pack skill and copy it back on each SessionStart, and Claude Code
+# discovers skills while those hooks run: a session looking in between found
+# the skill missing. Same inode means the file was never replaced.
+_inode() { ls -id "$1" 2>/dev/null | awk '{print $1}'; }
+INODE_BEFORE=$(_inode "$SYMLINK_ROOT/skills/my-command/SKILL.md")
+CLAUDE_PLUGIN_ROOT="$SYMLINK_ROOT" pack_sync_symlinks
+if [[ -n "$INODE_BEFORE" && "$INODE_BEFORE" == "$(_inode "$SYMLINK_ROOT/skills/my-command/SKILL.md")" ]]; then
+    log_pass "a sync with nothing to change keeps the pack skill in place (same file)"
+else
+    log_fail "Skill churn" "the copy was replaced by a sync that had nothing to change"
+fi
+rm -f "$SYMLINK_ROOT/skills/my-command/SKILL.md"
+ln -sf "../../../$(basename "$TEST_PACKS_DIR")/test-symlink/commands/my-command.md" "$SYMLINK_ROOT/skills/my-command/SKILL.md"
+CLAUDE_PLUGIN_ROOT="$SYMLINK_ROOT" pack_sync_symlinks
+if [[ -f "$SYMLINK_ROOT/skills/my-command/SKILL.md" && ! -L "$SYMLINK_ROOT/skills/my-command/SKILL.md" ]]; then
+    log_pass "a symlink left by an older version is replaced by the copy"
+else
+    log_fail "Legacy symlink replacement" "still a symlink"
+fi
+# A pack that goes away takes its skill directory with it, a core skill stays.
+mkdir -p "$SYMLINK_ROOT/skills/core-skill"; printf 'core\n' > "$SYMLINK_ROOT/skills/core-skill/SKILL.md"
+rm -f "$SYMLINK_PACK_DIR/commands/my-command.md"
+CLAUDE_PLUGIN_ROOT="$SYMLINK_ROOT" pack_sync_symlinks
+if [[ ! -e "$SYMLINK_ROOT/skills/my-command" && -f "$SYMLINK_ROOT/skills/core-skill/SKILL.md" ]]; then
+    log_pass "a removed pack command sweeps its copy and its directory; a core skill is untouched"
+else
+    log_fail "Skill sweep" "$(ls "$SYMLINK_ROOT/skills" | tr '\n' ' ')"
+fi
+touch "$SYMLINK_PACK_DIR/commands/my-command.md"
+CLAUDE_PLUGIN_ROOT="$SYMLINK_ROOT" pack_sync_symlinks
+
+# Symlinks must RESOLVE, not just exist. On BSD/macOS, realpath lacks
+# --relative-to: the old code silently produced empty-target symlinks
+# that pass -L but fail -e.
+if [[ -e "$SYMLINK_ROOT/agents/my-agent.md" ]]; then
+    log_pass "Agent symlink target resolves (non-empty, valid)"
+else
+    log_fail "Agent symlink broken" "target: '$(readlink "$SYMLINK_ROOT/agents/my-agent.md")'"
+fi
+
+
+if [[ ! -e "$SYMLINK_ROOT/agents/stale-agent.md" ]]; then
+    log_pass "Stale symlink cleaned by pack_sync_symlinks"
+else
+    log_fail "Stale symlink cleanup" "stale-agent.md still present"
+fi
+
+rm -rf "$SYMLINK_ROOT"
+
+# =============================================================================
+# 7. _pack_reset - clears all state
+# =============================================================================
+echo ""
+echo "=== State Reset ==="
+
+export CLAUDE_PLUGIN_OPTION_stack="symfony"
+pack_loader_init "$TEST_PACKS_DIR"
+_pack_reset
+
+loaded=$(pack_loaded)
+if [[ -z "$loaded" ]]; then
+    log_pass "_pack_reset clears loaded pack list"
+else
+    log_fail "_pack_reset" "loaded packs not empty after reset: '$loaded'"
+fi
+
+types=$(pack_list_scaffold_types)
+if [[ -z "$types" ]]; then
+    log_pass "_pack_reset clears scaffold types"
+else
+    log_fail "_pack_reset" "scaffold types not empty after reset: '$types'"
+fi
+
+# =============================================================================
+# 8. Integration: Symlink creation for agents and commands
+# =============================================================================
+echo ""
+echo "=== Integration: Symlink Creation ==="
+
+_pack_reset
+export CLAUDE_PLUGIN_OPTION_stack="symfony"
+
+INTEG_ROOT="/tmp/craftsman-integ-symlink-$$"
+mkdir -p "$INTEG_ROOT/packs/test-pack/agents" "$INTEG_ROOT/packs/test-pack/commands"
+mkdir -p "$INTEG_ROOT/agents" "$INTEG_ROOT/skills"
+
+cat > "$INTEG_ROOT/packs/test-pack/pack.yml" <<'YAML'
+name: test-pack
+version: "1.0.0"
+description: "Test pack"
+compatibility:
+  core: ">=2.4.0"
+  stack: ["symfony", "fullstack"]
+hooks:
+  validators: []
+agents: ["agents/test-agent.md"]
+commands: []
+YAML
+echo -e "---\nname: test-agent\n---" > "$INTEG_ROOT/packs/test-pack/agents/test-agent.md"
+echo -e "---\ndescription: test\n---" > "$INTEG_ROOT/packs/test-pack/commands/test-cmd.md"
+
+CLAUDE_PLUGIN_ROOT="$INTEG_ROOT" pack_loader_init "$INTEG_ROOT/packs"
+CLAUDE_PLUGIN_ROOT="$INTEG_ROOT" pack_sync_symlinks
+
+if [[ -L "$INTEG_ROOT/agents/test-agent.md" ]]; then
+    log_pass "Integration: agent symlink created in agents/"
+else
+    log_fail "Integration: agent symlink creation" "agents/test-agent.md symlink missing"
+fi
+
+if [[ -f "$INTEG_ROOT/skills/test-cmd/SKILL.md" && ! -L "$INTEG_ROOT/skills/test-cmd/SKILL.md" ]]; then
+    log_pass "Integration: pack skill materialised in skills/test-cmd/"
+else
+    log_fail "Integration: pack skill materialisation" "skills/test-cmd/SKILL.md missing or a symlink"
+fi
+
+# =============================================================================
+# 9. Integration: Stale symlink cleanup
+# =============================================================================
+echo ""
+echo "=== Integration: Stale Symlink Cleanup ==="
+
+ln -sf "/nonexistent/old-agent.md" "$INTEG_ROOT/agents/old-agent.md"
+
+_pack_reset
+CLAUDE_PLUGIN_ROOT="$INTEG_ROOT" pack_loader_init "$INTEG_ROOT/packs"
+CLAUDE_PLUGIN_ROOT="$INTEG_ROOT" pack_sync_symlinks
+
+if [[ ! -L "$INTEG_ROOT/agents/old-agent.md" && ! -e "$INTEG_ROOT/agents/old-agent.md" ]]; then
+    log_pass "Integration: stale symlink removed by pack_sync_symlinks"
+else
+    log_fail "Integration: stale symlink cleanup" "old-agent.md still present"
+fi
+
+if [[ -L "$INTEG_ROOT/agents/test-agent.md" ]]; then
+    log_pass "Integration: valid symlink preserved after stale cleanup"
+else
+    log_fail "Integration: valid symlink preserved" "test-agent.md missing after stale cleanup"
+fi
+
+# =============================================================================
+# 9b. The sweep only owns what the packs put there
+#
+# pack_sync_symlinks runs on SessionStart against the live checkout. It used to
+# remove every symlink under agents/ and skills/*/SKILL.md and rmdir every
+# skill directory, then recreate only what the loaded packs provide. Anything
+# else a developer had put there was deleted and never restored, and a core
+# skill's directory was one failed rmdir away from going with it.
+# =============================================================================
+echo ""
+echo "=== Integration: The sweep leaves everything it does not own ==="
+
+OUTSIDE="$INTEG_ROOT/outside"
+mkdir -p "$OUTSIDE"
+printf -- '---\nname: mine\n---\n' > "$OUTSIDE/mine.md"
+ln -sf "$OUTSIDE/mine.md" "$INTEG_ROOT/agents/mine.md"
+
+mkdir -p "$INTEG_ROOT/skills/core-skill"
+printf -- '---\nname: core\n---\n' > "$INTEG_ROOT/skills/core-skill/SKILL.md"
+
+mkdir -p "$INTEG_ROOT/skills/borrowed"
+ln -sf "$OUTSIDE/mine.md" "$INTEG_ROOT/skills/borrowed/SKILL.md"
+
+_pack_reset
+CLAUDE_PLUGIN_ROOT="$INTEG_ROOT" pack_loader_init "$INTEG_ROOT/packs"
+CLAUDE_PLUGIN_ROOT="$INTEG_ROOT" pack_sync_symlinks
+
+if [[ -L "$INTEG_ROOT/agents/mine.md" ]]; then
+    log_pass "an agent symlink pointing outside packs/ survives the sweep"
+else
+    log_fail "sweep too wide" "deleted a symlink no pack created"
+fi
+
+if [[ -f "$INTEG_ROOT/skills/core-skill/SKILL.md" ]]; then
+    log_pass "a core skill and its directory survive the sweep"
+else
+    log_fail "sweep too wide" "removed a core skill"
+fi
+
+if [[ -L "$INTEG_ROOT/skills/borrowed/SKILL.md" ]]; then
+    log_pass "a skill symlink pointing outside packs/ survives the sweep"
+else
+    log_fail "sweep too wide" "deleted a skill symlink no pack created"
+fi
+
+# The counter-test: it must still remove what a pack did create, or the three
+# assertions above are satisfied by a sweep that stopped working.
+if [[ -L "$INTEG_ROOT/agents/test-agent.md" ]]; then
+    _pack_reset
+    _PACKS_DIR="$INTEG_ROOT/packs" CLAUDE_PLUGIN_ROOT="$INTEG_ROOT" pack_sync_symlinks
+    if [[ -L "$INTEG_ROOT/agents/test-agent.md" || -e "$INTEG_ROOT/agents/test-agent.md" ]]; then
+        log_fail "sweep too narrow" "a pack symlink survived with no pack loaded"
+    else
+        log_pass "a pack symlink is still removed once its pack is not loaded"
+    fi
+else
+    log_fail "no pack symlink to test with" "the counter-test would pass vacuously"
+fi
+
+# =============================================================================
+# 10. Integration: Real files not deleted by cleanup
+# =============================================================================
+echo ""
+echo "=== Integration: Real Files Not Deleted ==="
+
+echo "real file content" > "$INTEG_ROOT/agents/real-agent.md"
+
+_pack_reset
+CLAUDE_PLUGIN_ROOT="$INTEG_ROOT" pack_loader_init "$INTEG_ROOT/packs"
+CLAUDE_PLUGIN_ROOT="$INTEG_ROOT" pack_sync_symlinks
+
+if [[ -f "$INTEG_ROOT/agents/real-agent.md" && ! -L "$INTEG_ROOT/agents/real-agent.md" ]]; then
+    log_pass "Integration: real file preserved (not deleted by symlink cleanup)"
+else
+    log_fail "Integration: real file preservation" "real-agent.md was deleted or turned into symlink"
+fi
+
+rm -rf "$INTEG_ROOT"
+
+# =============================================================================
+# Cleanup
+# =============================================================================
+# --- The compiled manifest cache decides which validators run ----------------
+#
+# Three ways it silently disarmed every pack, each measured before the fix:
+# a torn read (twelve concurrent readers, three saw zero entries), a cache
+# emptied by a crash or a full disk (served forever after, `-nt` cannot see
+# it), and a key that mapped `a/b` and `a_b` to the same file (one pack served
+# another's validators). Exit 0 and no message in all three.
+CACHE_WORK=$(mktemp -d "${TMPDIR:-/tmp}/craftsman-yml-cache.XXXXXX")
+mkdir -p "$CACHE_WORK/a/b" "$CACHE_WORK/a_b" "$CACHE_WORK/data"
+printf 'compatibility:\n  stack: ["ALPHA"]\n' > "$CACHE_WORK/a/b/pack.yml"
+printf 'compatibility:\n  stack: ["BETA"]\n' > "$CACHE_WORK/a_b/pack.yml"
+
+_cached_stack() {
+    CLAUDE_PLUGIN_DATA="$CACHE_WORK/data" bash -c \
+        "source '$ROOT_DIR/hooks/lib/pack-loader.sh'; _pack_yml_nested_array compatibility stack '$1'"
+}
+
+slash=$(_cached_stack "$CACHE_WORK/a/b/pack.yml")
+underscore=$(_cached_stack "$CACHE_WORK/a_b/pack.yml")
+if [[ "$slash" == "ALPHA" && "$underscore" == "BETA" ]]; then
+    log_pass "two manifests whose paths differ only by / and _ keep their own cache"
+else
+    log_fail "two manifests whose paths differ only by / and _ keep their own cache" \
+        "a/b gave '$slash', a_b gave '$underscore'"
+fi
+
+# A cache emptied outside this process must be recompiled, not served. The
+# header line is what makes that detectable: an empty COMPILE is legitimate, so
+# emptiness alone cannot be the test.
+for cached in "$CACHE_WORK/data/cache/pack-yml"/*; do
+    [[ -f "$cached" ]] && : > "$cached"
+done
+repaired=$(_cached_stack "$CACHE_WORK/a/b/pack.yml")
+if [[ "$repaired" == "ALPHA" ]]; then
+    log_pass "a cache emptied by a crash repairs itself instead of disarming the pack"
+else
+    log_fail "a cache emptied by a crash repairs itself" "got '$repaired'"
+fi
+
+# A manifest that could not be read must not leave a poisoned empty cache newer
+# than itself, which the previous version served forever after.
+rm -rf "$CACHE_WORK/data/cache"
+chmod 000 "$CACHE_WORK/a/b/pack.yml"
+_cached_stack "$CACHE_WORK/a/b/pack.yml" >/dev/null 2>&1
+chmod 644 "$CACHE_WORK/a/b/pack.yml"
+recovered=$(_cached_stack "$CACHE_WORK/a/b/pack.yml")
+if [[ "$recovered" == "ALPHA" ]]; then
+    log_pass "an unreadable manifest does not poison the cache for good"
+else
+    log_fail "an unreadable manifest does not poison the cache for good" "got '$recovered'"
+fi
+
+# Twelve readers on a cold cache, all of which must see the whole compile.
+rm -rf "$CACHE_WORK/data/cache"
+python3 -c "
+entries = ','.join('\"s%d\"' % i for i in range(401))
+open('$CACHE_WORK/big.yml', 'w').write('compatibility:\n  stack: [' + entries + ']\n')
+"
+COUNTS="$CACHE_WORK/counts"
+for _ in $(seq 1 12); do
+    ( _cached_stack "$CACHE_WORK/big.yml" | grep -c . >> "$COUNTS" ) &
+done
+wait
+# `grep -vc` exits 1 when nothing differs, and `|| echo 0` then appended a
+# second zero: the count came back as two lines and the numeric test failed on
+# a run that was actually clean.
+torn=$(awk '$0 != 401 { n++ } END { print n + 0 }' "$COUNTS")
+if [[ "${torn:-1}" -eq 0 ]]; then
+    log_pass "twelve concurrent readers all see the whole compile"
+else
+    log_fail "twelve concurrent readers all see the whole compile" \
+        "$torn reader(s) got a truncated cache: $(sort -u "$COUNTS" | tr '\n' ' ')"
+fi
+
+# The cache is keyed by manifest mtime, and a manifest does not change when the
+# PARSER does. Without a version in the path, a release that fixes the awk
+# would take effect on no installed machine, ever.
+if grep -q '_PACK_YML_CACHE_VERSION' "$ROOT_DIR/hooks/lib/pack-loader.sh"; then
+    log_pass "the cache path carries a parser version, not only the manifest mtime"
+else
+    log_fail "the cache path carries a parser version" \
+        "a parser fix would never reach an installed machine"
+fi
+
+# A manifest whose mtime moved BACKWARDS: `git checkout` of an older version,
+# `git stash pop`, `tar -x`, `rsync -t`. `-nt` only answers "is it newer", so
+# the cache stayed frozen on the newer content indefinitely, which is the pack
+# developer's everyday loop, the one the cache comment claims to protect.
+printf 'compatibility:\n  stack: ["NEW"]\n' > "$CACHE_WORK/a/b/pack.yml"
+_cached_stack "$CACHE_WORK/a/b/pack.yml" >/dev/null
+printf 'compatibility:\n  stack: ["RESTORED"]\n' > "$CACHE_WORK/a/b/pack.yml"
+touch -t 202001010000 "$CACHE_WORK/a/b/pack.yml"
+restored=$(_cached_stack "$CACHE_WORK/a/b/pack.yml")
+if [[ "$restored" == "RESTORED" ]]; then
+    log_pass "a manifest restored from an older version is re-read, not served stale"
+else
+    log_fail "a manifest restored from an older version is re-read" "got '$restored'"
+fi
+
+# A path no filesystem will hold as a file name. The escaping triples every
+# underscore and mktemp adds six characters, so a deep checkout crossed
+# NAME_MAX, mktemp failed, and the pack lost every validator with nothing on
+# stderr.
+DEEP="$CACHE_WORK/$(python3 -c "print('/'.join('seg%02d_x' % i for i in range(24)))")"
+mkdir -p "$DEEP"
+printf 'hooks:\n  validators: ["deep.sh"]\n' > "$DEEP/pack.yml"
+deep_result=$(CLAUDE_PLUGIN_DATA="$CACHE_WORK/data" bash -c \
+    "source '$ROOT_DIR/hooks/lib/pack-loader.sh'; _pack_yml_nested_array hooks validators '$DEEP/pack.yml'" 2>/dev/null)
+if [[ "$deep_result" == "deep.sh" ]]; then
+    log_pass "a manifest too deep for a cache file name is still parsed"
+else
+    log_fail "a manifest too deep for a cache file name is still parsed" "got '$deep_result'"
+fi
+
+# A cache is an optimisation. A read-only data directory must change the cost
+# and never the answer.
+chmod 500 "$CACHE_WORK/data" 2>/dev/null || true
+readonly_result=$(CLAUDE_PLUGIN_DATA="$CACHE_WORK/data" bash -c \
+    "source '$ROOT_DIR/hooks/lib/pack-loader.sh'; _pack_yml_nested_array hooks validators '$DEEP/pack.yml'" 2>/dev/null)
+chmod 700 "$CACHE_WORK/data" 2>/dev/null || true
+if [[ "$readonly_result" == "deep.sh" ]]; then
+    log_pass "an unwritable cache directory falls back to parsing the manifest"
+else
+    log_fail "an unwritable cache directory falls back to parsing the manifest" "got '$readonly_result'"
+fi
+
+rm -rf "$CACHE_WORK"
+
+unset CLAUDE_PLUGIN_OPTION_stack 2>/dev/null || true
+rm -rf "$TEST_PACKS_DIR"
+
+# =============================================================================
+# The committed pack skills are their sources, byte for byte
+#
+# skills/<name>/SKILL.md for every packs/*/commands/<name>.md is a tracked
+# regular file (a fresh install has all 22 skills before any SessionStart, and
+# the Codex loader lists it), refreshed by pack_sync_symlinks. Committed, it
+# can drift from its source between two syncs: this check refuses the drift.
+# =============================================================================
+echo ""
+echo "=== Committed pack skills match their sources ==="
+DRIFT=""
+for src in "$ROOT_DIR"/packs/*/commands/*.md; do
+    [[ -f "$src" ]] || continue
+    name=$(basename "$src" .md)
+    copy="$ROOT_DIR/skills/$name/SKILL.md"
+    if [[ -L "$copy" ]]; then DRIFT="${DRIFT} ${name}(symlink)"
+    elif [[ ! -f "$copy" ]]; then DRIFT="${DRIFT} ${name}(missing)"
+    elif ! cmp -s "$src" "$copy"; then DRIFT="${DRIFT} ${name}(differs)"
+    fi
+done
+if [[ -z "$DRIFT" ]]; then
+    log_pass "every pack command has an identical regular skills/<name>/SKILL.md"
+else
+    log_fail "pack skill copies drift from their sources" "run pack_sync_symlinks:${DRIFT}"
+fi
+
+# The identity list answers for a manifest named the way the loop names it,
+# packs/go//pack.yml, without a stat. A fallback stat returns the same identity,
+# so no output can tell the two apart: a stat on PATH that records being called
+# is the witness. Under bash 3.2 the lookup missed every time and nobody saw it.
+check_identity_served_from_list() {
+    local stub
+    stub=$(mktemp -d "${TMPDIR:-/tmp}/craftsman-stat-stub.XXXXXX")
+    printf '#!/bin/sh\necho called >> "%s/calls"\nexit 1\n' "$stub" > "$stub/stat"
+    chmod +x "$stub/stat"
+    _pack_yml_identities_load "$ROOT_DIR"/packs/*/pack.yml
+    PATH="$stub:$PATH" _pack_yml_identity "$ROOT_DIR/packs/go//pack.yml" >/dev/null
+    if [[ ! -f "$stub/calls" ]]; then
+        log_pass "a manifest named with the loop's // is answered from the identity list, no stat"
+    else
+        log_fail "identity list lookup" "stat ran for a manifest the list holds"
+    fi
+    rm -rf "$stub"
+}
+check_identity_served_from_list
+
+test_summary

@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Every published claim about the gate is the claim the code makes.
+#
+# A claims audit of 4.9.0 found fourteen sentences the code contradicted. Nine
+# were fixed with the code they described; the five here had no owner, because
+# nothing compares a document to its subject. Each check below reads the code
+# first and the document second, so the document is what has to move.
+# =============================================================================
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+source "$SCRIPT_DIR/../lib/test-helpers.sh"
+
+echo "=== Documented claims against the code ==="
+
+# -----------------------------------------------------------------------------
+# 1. The Level 2/3 budget is the one static-analysis.sh applies.
+# -----------------------------------------------------------------------------
+# "<2s" was published in four files while the analysers ran under a 15s per
+# file / 30s per project budget. static-analysis.sh:15-22 says in its own
+# comment that 2 seconds is below the cold start of the tools it runs.
+BUDGET_FILE=$(grep -oE 'CRAFTSMAN_SA_BUDGET_FILE:-[0-9]+' "$ROOT_DIR/hooks/lib/static-analysis.sh" | head -1 | grep -oE '[0-9]+$')
+BUDGET_PROJECT=$(grep -oE 'CRAFTSMAN_SA_BUDGET_PROJECT:-[0-9]+' "$ROOT_DIR/hooks/lib/static-analysis.sh" | head -1 | grep -oE '[0-9]+$')
+if [[ -n "$BUDGET_FILE" && -n "$BUDGET_PROJECT" ]]; then
+    log_pass "static analysis budgets read from the code: ${BUDGET_FILE}s per file, ${BUDGET_PROJECT}s per project"
+else
+    log_fail "static analysis budgets could be read" "got file='${BUDGET_FILE}' project='${BUDGET_PROJECT}'"
+fi
+
+stale_latency=$(grep -rnE '\| *(2|3) *\|.*\| *<? *2 *s' "$ROOT_DIR/docs" 2>/dev/null || true)
+stale_latency+=$(grep -rnE 'Level (2|3)[^.]{0,60}<2s' "$ROOT_DIR/docs" "$ROOT_DIR/README.md" "$ROOT_DIR/CLAUDE.md" "$ROOT_DIR/FAQ.md" 2>/dev/null || true)
+if [[ -z "$stale_latency" ]]; then
+    log_pass "no document gives Level 2 or 3 a latency the analyser budget contradicts"
+else
+    log_fail "no document gives Level 2 or 3 a latency the analyser budget contradicts" "$stale_latency"
+fi
+
+# -----------------------------------------------------------------------------
+# 2. SECURITY.md names every CRAFTSMAN_* switch the code reads.
+# -----------------------------------------------------------------------------
+# The document told an auditor which environment variables the plugin may read.
+# It listed nine of the eighteen the code reads, which is worse than listing
+# none: the reader stops looking.
+missing_env=""
+while IFS= read -r var; do
+    grep -q "$var" "$ROOT_DIR/SECURITY.md" || missing_env+="$var "
+done < <(grep -rhoE 'CRAFTSMAN_[A-Z_]+' "$ROOT_DIR/hooks" "$ROOT_DIR/ci" "$ROOT_DIR/packs" \
+            --include='*.sh' --include='*.py' 2>/dev/null | sort -u)
+if [[ -z "$missing_env" ]]; then
+    log_pass "SECURITY.md names every CRAFTSMAN_* variable the code reads"
+else
+    log_fail "SECURITY.md names every CRAFTSMAN_* variable the code reads" "missing: $missing_env"
+fi
+
+# -----------------------------------------------------------------------------
+# 3. A hook that warns is not documented as a gate.
+# -----------------------------------------------------------------------------
+# pre-push-verify.sh prints a warning and exits 0 on an unverified session.
+# SECURITY.md's hook table said "Gates `git push`", which is the one line an
+# auditor would rely on to believe an unverified push cannot happen.
+if grep -q 'Warning only - do not block the push' "$ROOT_DIR/hooks/pre-push-verify.sh"; then
+    if grep -qE '`pre-push-verify\.sh`.*Gates `git push`' "$ROOT_DIR/SECURITY.md"; then
+        log_fail "pre-push-verify.sh is documented as what it is" \
+            "the script warns and exits 0, SECURITY.md says it gates the push"
+    else
+        log_pass "pre-push-verify.sh is documented as a warning, which is what it does"
+    fi
+else
+    log_pass "pre-push-verify.sh blocks, and the documented wording may say so"
+fi
+
+# -----------------------------------------------------------------------------
+# 4. Levels 2 and 3 are off until the machine owner trusts the project's tools.
+# -----------------------------------------------------------------------------
+# The network table said "Level 1-3 | On", and the same document says 250 lines
+# further down that running the project's analysers is code execution and is
+# off by default. Both cannot be true.
+if grep -q 'config_trust_project_tools' "$ROOT_DIR/hooks/lib/static-analysis.sh"; then
+    if grep -qE '\| *Regex \+ static analysis hooks \(Level 1-3\) *\| *On *\|' "$ROOT_DIR/SECURITY.md"; then
+        log_fail "the network table matches the trust gate" \
+            "Level 2/3 need trust_project_tools: true (off by default), the table says Level 1-3 On"
+    else
+        log_pass "the network table does not claim Levels 2 and 3 run by default"
+    fi
+else
+    log_pass "static analysis is not gated on trust_project_tools"
+fi
+
+# -----------------------------------------------------------------------------
+# 5. A model named for an agent is the model in its frontmatter.
+# -----------------------------------------------------------------------------
+LEAD_MODEL=$(grep -m1 '^model:' "$ROOT_DIR/agents/team-lead.md" | awk '{print $2}')
+bad_model=$(grep -rniE 'team lead[^|]{0,12}: *(sonnet|opus|haiku)' "$ROOT_DIR/docs" 2>/dev/null \
+    | grep -viE ": *${LEAD_MODEL}" || true)
+if [[ -z "$bad_model" ]]; then
+    log_pass "every document naming the team lead's model says ${LEAD_MODEL}"
+else
+    log_fail "every document naming the team lead's model says ${LEAD_MODEL}" "$bad_model"
+fi
+
+# -----------------------------------------------------------------------------
+# 6. A rules table in the docs is complete or it is not a rules table.
+# -----------------------------------------------------------------------------
+# docs/ci-integration.md listed 13 rule ids as "the rules", with no SEC, PY, GO,
+# RUST or SH rule among them, at a time when the registry compiled 66. A partial
+# list presented as the list is read as the scope of the gate.
+REGISTRY_COUNT=$(CLAUDE_PLUGIN_DATA="$(mktemp -d)" python3 "$ROOT_DIR/hooks/lib/rule_registry.py" \
+    "$ROOT_DIR/rules/core.yml" "$ROOT_DIR"/packs/*/pack.yml 2>/dev/null | wc -l | tr -d ' ')
+DOC_RULES=$(grep -cE '^\| `[A-Z]+[0-9-]*[A-Z0-9]*` \| ' "$ROOT_DIR/docs/ci-integration.md" 2>/dev/null | head -1)
+DOC_RULES="${DOC_RULES:-0}"
+if [[ "$DOC_RULES" -eq 0 || "$DOC_RULES" -ge "$REGISTRY_COUNT" ]]; then
+    log_pass "docs/ci-integration.md lists no partial rules table (registry: ${REGISTRY_COUNT} rules)"
+else
+    log_fail "docs/ci-integration.md lists no partial rules table" \
+        "the table carries ${DOC_RULES} rules, the registry compiles ${REGISTRY_COUNT}"
+fi
+
+# -----------------------------------------------------------------------------
+# 7. An example never declares Level 2 active without consent and a run.
+# -----------------------------------------------------------------------------
+# examples/healthcheck/01-plugin-diagnostic.md went from "vendor/bin/phpstan
+# found" to "Level 2: active, fully operational". sa_analyze_file returns
+# before any analyser runs unless the machine owner set trust_project_tools in
+# the global file, so on a fresh install that verdict was false (CR-178, M18).
+# The example's own commands are run: the consent check against both answers,
+# the probe through the gate's dispatcher with a stand-in phpstan.
+DIAG="$ROOT_DIR/examples/healthcheck/01-plugin-diagnostic.md"
+example_block() {
+    awk -v label="$2" '!found && /^#/ && index($0, label){found=1; next}
+        found && /^```bash/{code=1; next}
+        code && /^```/{exit}
+        code' "$1"
+}
+unconsented=$(grep -rlE 'Level 2[^|]*\*\*active\*\*' "$ROOT_DIR/examples" 2>/dev/null \
+    | while IFS= read -r f; do grep -q 'trust_project_tools' "$f" || echo "${f#"$ROOT_DIR"/}"; done)
+CONSENT_CMD=$(example_block "$DIAG" "Check the consent")
+PROBE_CMD=$(example_block "$DIAG" "Observe a run")
+L2_DIR=$(mktemp -d "${TMPDIR:-/tmp}/doc-claims-l2.XXXXXX")
+mkdir -p "$L2_DIR/home/.claude" "$L2_DIR/project/vendor/bin" "$L2_DIR/tmp"
+printf '#!/bin/sh\necho "$2:4:Undefined variable: \\$total"\n' > "$L2_DIR/project/vendor/bin/phpstan"
+chmod +x "$L2_DIR/project/vendor/bin/phpstan"
+l2_run() {
+    (cd "$L2_DIR/project" && HOME="$L2_DIR/home" TMPDIR="$L2_DIR/tmp" PATH="$ROOT_DIR/bin:$PATH" \
+        bash -c "$1" 2>/dev/null | tr '\n' ' ')
+}
+CONSENT_OFF=$(l2_run "$CONSENT_CMD"); PROBE_OFF=$(l2_run "$PROBE_CMD")
+printf 'v: 4\ntrust_project_tools: true\n' > "$L2_DIR/home/.claude/.craft-config.yml"
+CONSENT_ON=$(l2_run "$CONSENT_CMD"); PROBE_ON=$(l2_run "$PROBE_CMD")
+rm -rf "$L2_DIR"
+if [[ -z "$unconsented" && -n "$CONSENT_CMD" && -n "$PROBE_CMD" \
+      && "$CONSENT_OFF" == *"not trusted"* && "$CONSENT_ON" != *"not trusted"* && "$CONSENT_ON" == *trusted* \
+      && "$PROBE_OFF" != *PHPSTAN* && "$PROBE_ON" == *PHPSTAN002* ]]; then
+    log_pass "the diagnostic example checks consent and observes Level 2 run before calling it active"
+else
+    log_fail "Level 2 declared active without consent and an observed run" \
+        "unconsented examples: '${unconsented}'; consent off/on: '${CONSENT_OFF}'/'${CONSENT_ON}'; probe off/on: '${PROBE_OFF}'/'${PROBE_ON}'"
+fi
+
+# -----------------------------------------------------------------------------
+# 8. The pre-push hook is documented as the warning it is, the monitor as the
+#    log tail it is, and ADR-0023 says so in an amendment.
+# -----------------------------------------------------------------------------
+# README, SECURITY.md and three guides said "CI and the pre-push gate catch"
+# shell-written files, and ADR-0023 calls pre-push-verify.sh "the last
+# deterministic gate" and announces phpstan/vitest watchers. The hook reads no
+# file and always allows the push; monitors.json tails one log (CR-178, M17).
+# The Hermes terminal gate, which does refuse a push, is described as such.
+PUSH_HOOK="$ROOT_DIR/hooks/pre-push-verify.sh"
+if grep -q 'Warning only - do not block the push' "$PUSH_HOOK" && ! grep -qE '^[^#]*exit 2' "$PUSH_HOOK"; then
+    push_claims=$(grep -rniE 'pre-push gate|garde-fou pre-push|pre-push-verify\.sh` before the push|^# Blocks git push|Validate git push commands' \
+        "$ROOT_DIR/README.md" "$ROOT_DIR/README.fr.md" "$ROOT_DIR/SECURITY.md" "$ROOT_DIR/docs/guides" \
+        "$ROOT_DIR/docs/reference" "$PUSH_HOOK" 2>/dev/null | sed "s|$ROOT_DIR/||" || true)
+    if [[ -z "$push_claims" ]]; then
+        log_pass "no document calls the pre-push warning a gate that catches files"
+    else
+        log_fail "the pre-push hook warns and reads no file, documents call it a gate" "$(printf '%s' "$push_claims" | tr '\n' ' ' | cut -c1-600)"
+    fi
+else
+    log_pass "pre-push-verify.sh blocks, and a gate is what the documents may call it"
+fi
+
+ADR23="$ROOT_DIR/docs/adr/0023-deterministic-verification-loop.md"
+AMENDMENT=$(awk '/^## Amendment/{inside=1} inside' "$ADR23")
+watchers_shipped=$(jq -r '.[].command' "$ROOT_DIR/monitors/monitors.json" 2>/dev/null | grep -ciE 'phpstan|vitest|--watch' || true)
+if [[ "$watchers_shipped" -gt 0 ]] \
+    || { [[ "$AMENDMENT" == *pre-push-verify.sh* && "$AMENDMENT" == *monitors.json* && "$AMENDMENT" == *session-writes* ]]; }; then
+    log_pass "ADR-0023 carries an amendment for the push warning, the single monitor and the evidence it reads"
+else
+    log_fail "ADR-0023 amendment" "no '## Amendment' naming pre-push-verify.sh, monitors.json and the session-writes evidence"
+fi
+
+# -----------------------------------------------------------------------------
+# 9. A command a guide hands to a terminal runs, and a reference page says what
+#    the manifests say (CR-178, M17).
+# -----------------------------------------------------------------------------
+# Each check reads the consumer first: the Bash tool's environment (Claude Code
+# documents that CLAUDE_PLUGIN_ROOT is not in it), the absent package.json of
+# the retired RAG index, hooks.json, plugin.json, host-capabilities.json and
+# the agents' own frontmatter.
+root_in_shell=$(for f in "$ROOT_DIR"/README*.md "$ROOT_DIR"/docs/*.md "$ROOT_DIR"/docs/guides/*.md "$ROOT_DIR"/docs/reference/*.md; do
+    awk -v f="${f#"$ROOT_DIR"/}" '/^```(bash|sh|shell|console)/{c=1;next} c&&/^```/{c=0} c&&/CLAUDE_PLUGIN_ROOT/{print f":"NR}' "$f"
+done)
+[[ -z "$root_in_shell" ]] \
+    && log_pass "no guide hands a terminal a command that needs CLAUDE_PLUGIN_ROOT" \
+    || log_fail "guide commands need CLAUDE_PLUGIN_ROOT, which no shell has" "$(printf '%s' "$root_in_shell" | tr '\n' ' ')"
+
+if [[ ! -f "$ROOT_DIR/package.json" ]]; then
+    rag_index=$(grep -rln 'npm run index' "$ROOT_DIR/README.md" "$ROOT_DIR/README.fr.md" "$ROOT_DIR/docs/guides" "$ROOT_DIR/docs/reference" 2>/dev/null || true)
+    [[ -z "$rag_index" ]] \
+        && log_pass "no document prescribes the retired RAG index command" \
+        || log_fail "npm run index prescribed with no package.json to run it" "$(printf '%s' "$rag_index" | sed "s|$ROOT_DIR/||" | tr '\n' ' ')"
+fi
+
+if ! jq -e '.. | objects | select(has("InstructionsLoaded"))' "$ROOT_DIR/hooks/hooks.json" >/dev/null 2>&1; then
+    grep -qE '^\| *InstructionsLoaded *\||InstructionsLoaded agent' "$ROOT_DIR/docs/reference/hooks.md" \
+        && log_fail "hooks reference documents an InstructionsLoaded hook" "hooks.json wires none" \
+        || log_pass "the hooks reference documents no InstructionsLoaded hook, and hooks.json wires none"
+fi
+
+if ! jq -e 'has("packs")' "$ROOT_DIR/.claude-plugin/plugin.json" >/dev/null 2>&1; then
+    grep -rq '"packs": {' "$ROOT_DIR/docs/guides" 2>/dev/null \
+        && log_fail "a guide registers packs in plugin.json" "plugin.json has no packs key; packs/<name>/pack.yml is what the loader reads" \
+        || log_pass "no guide registers packs in plugin.json, which has no packs key"
+fi
+
+if jq -e '.hosts.codex' "$ROOT_DIR/hooks/host-capabilities.json" >/dev/null 2>&1; then
+    grep -qiE 'Codex[^.]*cannot run craftsman hooks' "$ROOT_DIR/skills/ci/SKILL.md" \
+        && log_fail "the ci skill says Codex cannot run craftsman hooks" "Codex is a qualified host in hooks/host-capabilities.json" \
+        || log_pass "no skill denies Codex the hooks the capability matrix qualifies"
+fi
+
+if grep -rq 'expands nothing' "$ROOT_DIR"/skills/*/SKILL.md 2>/dev/null; then
+    log_fail "skills say the host expands nothing in a skill body" \
+        "Claude Code documents substituting \${CLAUDE_PLUGIN_ROOT} inline in skill and agent content (plugins-reference, Where each variable resolves)"
+else
+    log_pass "no skill claims the host substitutes nothing in a skill body"
+fi
+
+agent_meta_drift=""
+while IFS= read -r agent_md; do
+    name=$(basename "$agent_md" .md)
+    front_matter=$(awk 'NR==1&&$0=="---"{i=1;next} i&&$0=="---"{exit} i' "$agent_md")
+    want="$(echo "$front_matter" | sed -n 's/^model: *//p')|$(echo "$front_matter" | sed -n 's/^effort: *//p')|$(echo "$front_matter" | sed -n 's/^memory: *//p')|$(echo "$front_matter" | sed -n 's/^maxTurns: *//p')"
+    want_skills=$(echo "$front_matter" | awk '/^skills:/{s=1;next} s&&/^  - /{sub(/^  - (craftsman:)?/,""); printf "%s,",$0; next} s{s=0}')
+    got=$(awk -v n="$name" '/^### /{here=($2==n)} here && /^\*\*Model\*\*/{print; exit}' "$ROOT_DIR/docs/reference/agents.md" \
+        | sed -E 's/\*\*Model\*\*: *([A-Za-z]+)[^|]*\| *\*\*Effort\*\*: *([a-z]+) *\| *\*\*Memory\*\*: *([a-z]+) *\| *\*\*Max Turns\*\*: *([0-9]+).*/\1|\2|\3|\4/' \
+        | tr '[:upper:]' '[:lower:]')
+    got_skills=$(awk -v n="$name" '/^### /{here=($2==n)} here && /^\*\*Skills\*\*/{sub(/^\*\*Skills\*\*: */,""); gsub(/ /,""); print $0 ","; exit}' "$ROOT_DIR/docs/reference/agents.md")
+    [[ -z "$got" || "$got" == "$want" ]] || agent_meta_drift+="${name}: doc ${got} vs frontmatter ${want}; "
+    [[ -z "$got_skills" || "$got_skills" == "$want_skills" ]] \
+        || agent_meta_drift+="${name}: skills doc '${got_skills}' vs frontmatter '${want_skills:-none}'; "
+done < <(find "$ROOT_DIR/agents" -maxdepth 1 -name '*.md' | sort)
+grep -q 'symlinked from the packs' "$ROOT_DIR/docs/reference/agents.md" && agent_meta_drift+="pack agents are shipped as copies, not symlinks; "
+[[ -z "$agent_meta_drift" ]] \
+    && log_pass "the agents reference states each agent's model, effort, memory, turns and skills as its frontmatter does" \
+    || log_fail "agents reference drifted from the frontmatter" "$agent_meta_drift"
+
+# Claude Code documents substituting CLAUDE_PLUGIN_ROOT inline in skill text
+# (plugins-reference, read 2026-09-27), but 2.1.278 did not do it for these
+# skills and exports no CLAUDE_PLUGIN_ROOT to the Bash tool at all (measured
+# 2026-09-20: the tool sees CLAUDECODE and the session id). Five skills sourced
+# their libraries through that variable, so /craftsman:healthcheck ran
+# `source "/hooks/lib/config.sh"` and the model improvised a diagnosis.
+ENV_IN_SKILLS=$(grep -ln 'CLAUDE_PLUGIN_ROOT}' "$ROOT_DIR"/skills/*/SKILL.md 2>/dev/null \
+    | while IFS= read -r f; do
+        # the prohibition is prose and wraps where it wraps: the check reads
+        # the file as one line so a reflow does not turn it into a failure
+        sed 's/^>[[:space:]]*//' "$f" | tr '\n' ' ' | tr -s ' ' \
+            | grep -q 'Do not use `${CLAUDE_PLUGIN_ROOT}` in a skill body' || basename "$(dirname "$f")"
+      done)
+if [[ -z "$ENV_IN_SKILLS" ]]; then
+    log_pass "no skill body resolves the plugin through an environment variable the Bash tool does not set"
+else
+    log_fail "skill bodies use CLAUDE_PLUGIN_ROOT" "$(printf '%s' "$ENV_IN_SKILLS" | tr '\n' ' ')"
+fi
+
+# The command those skills call resolves this installation from its own
+# location, through a symlink too (the Bash tool's PATH entry is one).
+CP_DIR=$(mktemp -d); CP_LINK="$CP_DIR/craftsman-path"
+ln -sf "$ROOT_DIR/bin/craftsman-path" "$CP_LINK" 2>/dev/null
+if [[ "$("$ROOT_DIR/bin/craftsman-path")" == "$ROOT_DIR" \
+    && "$("$ROOT_DIR/bin/craftsman-path" hooks/lib/config.sh)" == "$ROOT_DIR/hooks/lib/config.sh" \
+    && "$("$CP_LINK" hooks/lib)" == "$ROOT_DIR/hooks/lib" ]]; then
+    log_pass "craftsman-path prints this installation's paths, called directly or through a symlink"
+else
+    log_fail "craftsman-path" "root=$("$ROOT_DIR/bin/craftsman-path") link=$("$CP_LINK" hooks/lib 2>&1)"
+fi
+rm -rf "$CP_DIR"
+
+# -----------------------------------------------------------------------------
+# 10. No document makes a rule depend on the framework or on an enabled pack
+#     (CR-242).
+# -----------------------------------------------------------------------------
+# A PHP developer on Slim read the setup's stack question and the pack's
+# Symfony name as "this is a Symfony tool". The FAQ agreed with him: it said
+# rule enforcement "only activates for the packs you enable", while every
+# shipped pack declares `stack: ["*"]` and judges its own file types whatever
+# the stack says (#35). The code is read first: when every pack is
+# framework-agnostic, the documents must say so and must not say otherwise.
+gated_packs=""
+for manifest in "$ROOT_DIR"/packs/*/pack.yml; do
+    compat=$(awk '/^compatibility:/{c=1;next} c&&/^[^ #]/{c=0} c&&/^[[:space:]]*stack:/{print; exit}' "$manifest")
+    [[ "$compat" =~ \[\ *\"\*\"\ *\] ]] || gated_packs+="$(basename "$(dirname "$manifest")"): ${compat:-no stack}; "
+done
+if [[ -z "$gated_packs" ]]; then
+    log_pass "every shipped pack judges its files whatever the stack setting says"
+    pack_gating=$(grep -rniE '(only|just) (activates?|applies|runs?) for the packs you (enable|choose|select)|rules? (are|is) (enabled|disabled|switched) by (the|your) stack' \
+        "$ROOT_DIR"/README.md "$ROOT_DIR"/README.fr.md "$ROOT_DIR"/FAQ.md "$ROOT_DIR"/docs/guides "$ROOT_DIR"/docs/getting-started "$ROOT_DIR"/docs/reference 2>/dev/null || true)
+    [[ -z "$pack_gating" ]] \
+        && log_pass "no document makes rule enforcement depend on an enabled pack or on the stack" \
+        || log_fail "a document makes rule enforcement depend on an enabled pack or on the stack" "$(printf '%s' "$pack_gating" | sed "s|$ROOT_DIR/||" | tr '\n' ' ')"
+    missing_answer=""
+    for doc in FAQ.md README.md README.fr.md; do
+        grep -q 'Slim' "$ROOT_DIR/$doc" && grep -q 'composer.json' "$ROOT_DIR/$doc" || missing_answer+="$doc "
+    done
+    [[ -z "$missing_answer" ]] \
+        && log_pass "the FAQ and both READMEs tell a PHP developer outside Symfony that the rules hold for any framework" \
+        || log_fail "no framework-agnostic answer for a PHP developer outside Symfony" "missing in: $missing_answer"
+else
+    log_fail "a pack is gated by the stack, so the framework-agnostic claim in FAQ.md and the READMEs is false" "$gated_packs"
+fi
+if grep -q 'composer.json' "$ROOT_DIR/FAQ.md"; then
+    grep -q 'autoload\["psr-4"\]' "$ROOT_DIR/packs/symfony/hooks/php-namespace.sh" \
+        && log_pass "the root namespace the FAQ says comes from composer.json is the one the layer rules read" \
+        || log_fail "FAQ says the layer rules read composer.json" "php-namespace.sh no longer reads the psr-4 map"
+fi
+
+test_summary
