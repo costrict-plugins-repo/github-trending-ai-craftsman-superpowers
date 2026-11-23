@@ -1,0 +1,110 @@
+name: symfony
+version: "1.0.0"
+description: "PHP/Symfony craftsman pack - DDD, API Platform, Doctrine, Messenger"
+compatibility:
+  core: ">=2.4.0"
+  # `*`, not a stack list. Dispatch happens by extension through the language
+  # registry, so a stack list only meant this pack went silent on a repository
+  # whose declared stack named another ecosystem: a .php file with a known
+  # violation came back clean, exit 0, nothing printed, under `stack: python`.
+  # packs/go, packs/rust, packs/bash and packs/ai-ml declare `*` for the same
+  # reason (#35). The stack still selects the doctrine and the setup hints.
+  stack: ["*"]
+
+languages:
+  - id: php
+    extensions: [php]
+    # literal_syntax: which comment and string syntax the structural ratchet
+    # blanks before measuring, so a control keyword inside a string or a
+    # comment is not a decision point. A closed name the engine knows, never a
+    # list of characters: `quotes: ["'"]` declared on Rust would reproduce the
+    # lifetime bug and nothing would refuse it, while a name can be refused at
+    # compile time. See KNOWN_LITERAL_SYNTAXES in hooks/lib/lang_registry.py.
+    literal_syntax: both
+    entry_markers: [composer.json]
+    protected_configs: ["phpstan.neon", "phpstan.neon.dist", "phpstan.dist.neon", "deptrac.yaml", "deptrac.yml", "phpunit.xml", "phpunit.xml.dist", ".php-cs-fixer.php", ".php-cs-fixer.dist.php"]
+    validators: ["hooks/php-validator.sh", "hooks/layer-validator.sh", "hooks/persistence-validator.sh", "hooks/security-validator.sh"]
+    static_analysis: ["static-analysis/phpstan.sh"]
+    # deptrac reads the project's own layer graph, so where it produces a
+    # verdict on a boundary it outranks the import regex in layer-validator.sh.
+    # A claim is a deferral, never a deletion: with deptrac absent, timed out,
+    # or configured not to check the boundary, precedence_flush re-emits the
+    # regex finding with full severity resolution.
+    supersedes:
+      - vendor/bin/deptrac=LAYER001,LAYER002,LAYER003,LAYER004
+    test_commands: ["phpunit", "vendor/bin/phpunit", "bin/phpunit"]
+    # A PHPUnit run that exits 0 having executed no test, or no assertion,
+    # tested nothing and grants no verification evidence (CR-255). Captured
+    # from PHPUnit 12 in tests/fixtures/test-runs.
+    empty_run_markers:
+      - '^No tests executed!'
+      - '^Tests: [0-9]+, Assertions: 0[,.]'
+    lsp: "intelephense"
+    metrics_dialect: php-like
+
+rules:
+  # Rules this pack owns: the wording and the default severity that the
+  # exported doctrine and the rules engine both read from here.
+  #
+  # `decision:` is the adjudication a rule received when its ignore rate was
+  # measured (issue #31). It records the verdict and the reason so the next
+  # maintainer does not relitigate it, and it names the paths where the rule is
+  # structurally wrong WITHOUT hardcoding them here: a framework-specific
+  # exclusion baked into pack data is the same mistake as a language list baked
+  # into a hook. The relaxation belongs in the consuming project's
+  # .craft-rules.yml. The registry does not read this key, a human does.
+  owned:
+    - id: PHP001
+      group: PHP
+      text: "declare(strict_types=1) in every PHP file"
+      default_severity: block
+    - id: PHP002
+      group: PHP
+      text: "every class is final"
+      default_severity: block
+      decision: "scoped - an ORM subclasses its entities to build lazy proxies so they cannot be final, and 152 of the 153 recorded suppressions came from Domain entity directories; the validator already exempts a mapped entity, and a project relaxes its own proxy, fixture and test-double paths in .craft-rules.yml"
+    - id: PHP003
+      group: PHP
+      text: "no public setter - use behavioral methods"
+      default_severity: warn
+      decision: "scoped - a framework hydrates entities and form DTOs through setters, and inside entity directories 164 of 257 verdicts were suppressed against 3 of 15 everywhere else; it stays advisory and a project relaxes its persistence and input-DTO paths in .craft-rules.yml"
+    - id: PHP004
+      group: PHP
+      text: "no new DateTime() - inject a Clock abstraction"
+      default_severity: block
+    - id: PHP005
+      group: PHP
+      text: "no empty catch block"
+      default_severity: warn
+    - id: CTRL001
+      group: Structure
+      text: "a Controller performs no persistence - move it into an Application UseCase"
+      default_severity: warn
+      relaxed_in_tests: true
+    - id: WARN-PHP001
+      group: Advisory
+      text: "four or more parameters - consider an object"
+      default_severity: warn
+  builtin: ["PHP001", "PHP002", "PHP003", "PHP004", "PHP005", "WARN-PHP001", "LAYER001", "LAYER002", "LAYER003", "NEST001", "LOC001", "GOD001", "PARAM001", "CTRL001"]
+  static_analysis: ["PHPSTAN001", "PHPSTAN002", "PHPSTAN003", "PHPSTAN004", "PHPSTAN005", "DEPTRAC001"]
+
+hooks:
+  validators: ["hooks/php-validator.sh", "hooks/layer-validator.sh", "hooks/persistence-validator.sh", "hooks/security-validator.sh"]
+
+static_analysis:
+  tools: ["static-analysis/phpstan.sh"]
+
+commands:
+  scaffold_types: ["entity", "usecase", "api-resource"]
+
+agents: ["agents/backend-craftsman.md", "agents/api-craftsman.md", "agents/symfony-reviewer.md"]
+
+knowledge: ["knowledge/"]
+
+templates: ["templates/"]
+
+# Command suggestions this pack contributes to the routing table.
+routes:
+  - trigger: "Scaffold PHP entity, use case, repository"
+    command: "/craftsman:scaffold"
+    relaxed_in_tests: true

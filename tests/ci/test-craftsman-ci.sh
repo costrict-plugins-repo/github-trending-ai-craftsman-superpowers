@@ -1,0 +1,815 @@
+#!/usr/bin/env bash
+# =============================================================================
+# craftsman-ci CLI Tests
+# Tests ci/craftsman-ci.sh behavior across all supported rules and options.
+# =============================================================================
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+FIXTURES_DIR="$SCRIPT_DIR/fixtures"
+CLI="$ROOT_DIR/ci/craftsman-ci.sh"
+
+# Reuse core fixtures where applicable (moved from tests/hooks/ to tests/core/ in v2.5.0)
+HOOK_FIXTURES="$ROOT_DIR/tests/core/fixtures"
+
+source "$SCRIPT_DIR/../lib/test-helpers.sh"
+
+# =============================================================================
+# Guard: CLI must exist and be executable
+# =============================================================================
+if [[ ! -f "$CLI" ]]; then
+    echo "FATAL: craftsman-ci.sh not found at $CLI" >&2
+    exit 1
+fi
+
+chmod +x "$CLI"
+
+# =============================================================================
+# Helper: run CLI, return "exit_code|output"
+# =============================================================================
+run_ci() {
+    local output exit_code
+    output=$(bash "$CLI" "$@" 2>&1)
+    exit_code=$?
+    echo "${exit_code}|${output}"
+}
+
+# =============================================================================
+# 1. Exit code tests
+# =============================================================================
+echo ""
+echo "=== Exit Code Tests ==="
+
+# Clean PHP file → exit 0
+result=$(run_ci "$FIXTURES_DIR/valid-entity.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "Valid PHP file → exit 0 (clean)"
+else
+    log_fail "Valid PHP should exit 0" "got exit $exit_code"
+fi
+
+# Clean TS file → exit 0
+result=$(run_ci "$FIXTURES_DIR/valid-component.ts")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "Valid TS file → exit 0 (clean)"
+else
+    log_fail "Valid TS should exit 0" "got exit $exit_code"
+fi
+
+# Invalid PHP (missing strict_types) → exit 2
+result=$(run_ci "$FIXTURES_DIR/invalid-no-strict.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]]; then
+    log_pass "Invalid PHP (missing strict_types) → exit 2 (violations)"
+else
+    log_fail "Missing strict_types should exit 2" "got exit $exit_code"
+fi
+
+# Invalid TS (any type + default export) → exit 2
+result=$(run_ci "$FIXTURES_DIR/invalid-any.ts")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]]; then
+    log_pass "Invalid TS (any type) → exit 2 (violations)"
+else
+    log_fail "TS with any should exit 2" "got exit $exit_code"
+fi
+
+# Layer violation → exit 2
+result=$(run_ci "$FIXTURES_DIR/invalid-layer-violation.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]]; then
+    log_pass "Layer violation PHP → exit 2 (violations)"
+else
+    log_fail "Layer violation should exit 2" "got exit $exit_code"
+fi
+
+# =============================================================================
+# 2. Rule detection tests
+# =============================================================================
+echo ""
+echo "=== Rule Detection Tests ==="
+
+# PHP001 detected
+result=$(run_ci --format text "$FIXTURES_DIR/invalid-no-strict.php")
+output="${result#*|}"
+if echo "$output" | grep -q "PHP001"; then
+    log_pass "PHP001 (missing strict_types) detected in text output"
+else
+    log_fail "PHP001 should appear in output" "$output"
+fi
+
+# PHP002 detected (using hook fixture)
+result=$(run_ci --format text "$HOOK_FIXTURES/invalid-no-final.php")
+output="${result#*|}"
+if echo "$output" | grep -q "PHP002"; then
+    log_pass "PHP002 (missing final) detected in text output"
+else
+    log_fail "PHP002 should appear in output" "$output"
+fi
+
+# TS001 detected
+result=$(run_ci --format text "$FIXTURES_DIR/invalid-any.ts")
+output="${result#*|}"
+if echo "$output" | grep -q "TS001"; then
+    log_pass "TS001 (any type) detected in text output"
+else
+    log_fail "TS001 should appear in output" "$output"
+fi
+
+# TS002 detected (default export in invalid-any.ts)
+result=$(run_ci --format text "$FIXTURES_DIR/invalid-any.ts")
+output="${result#*|}"
+if echo "$output" | grep -q "TS002"; then
+    log_pass "TS002 (default export) detected in text output"
+else
+    log_fail "TS002 should appear in output" "$output"
+fi
+
+# LAYER001 detected
+result=$(run_ci --format text "$FIXTURES_DIR/invalid-layer-violation.php")
+output="${result#*|}"
+if echo "$output" | grep -q "LAYER001"; then
+    log_pass "LAYER001 (domain imports infra) detected in text output"
+else
+    log_fail "LAYER001 should appear in output" "$output"
+fi
+
+# =============================================================================
+# 3. JSON output format tests
+# =============================================================================
+echo ""
+echo "=== JSON Output Tests ==="
+
+# JSON output is valid JSON
+result=$(run_ci --format json "$FIXTURES_DIR/invalid-no-strict.php")
+output="${result#*|}"
+if echo "$output" | python3 -m json.tool >/dev/null 2>&1; then
+    log_pass "JSON output is valid JSON"
+else
+    log_fail "JSON output should be valid JSON" "${output:0:200}"
+fi
+
+# JSON has required top-level keys
+result=$(run_ci --format json "$FIXTURES_DIR/valid-entity.php")
+output="${result#*|}"
+if echo "$output" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert 'version' in d
+assert 'timestamp' in d
+assert 'config' in d
+assert 'summary' in d
+assert 'violations' in d
+" 2>/dev/null; then
+    log_pass "JSON has all required top-level keys (version, timestamp, config, summary, violations)"
+else
+    log_fail "JSON missing required keys" "${output:0:200}"
+fi
+
+# JSON summary has correct fields
+result=$(run_ci --format json "$FIXTURES_DIR/valid-entity.php")
+output="${result#*|}"
+if echo "$output" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+s = d['summary']
+assert 'files_scanned' in s
+assert 'violations' in s
+assert 'warnings' in s
+" 2>/dev/null; then
+    log_pass "JSON summary has files_scanned, violations, warnings fields"
+else
+    log_fail "JSON summary missing fields" "${output:0:200}"
+fi
+
+# JSON config has strictness and stack
+result=$(run_ci --format json "$FIXTURES_DIR/valid-entity.php")
+output="${result#*|}"
+if echo "$output" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = d['config']
+assert 'strictness' in c
+assert 'stack' in c
+" 2>/dev/null; then
+    log_pass "JSON config has strictness and stack fields"
+else
+    log_fail "JSON config missing fields" "${output:0:200}"
+fi
+
+# JSON violation has required fields
+result=$(run_ci --format json "$FIXTURES_DIR/invalid-no-strict.php")
+output="${result#*|}"
+if echo "$output" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert len(d['violations']) > 0
+v = d['violations'][0]
+assert 'rule' in v
+assert 'file' in v
+assert 'line' in v
+assert 'message' in v
+assert 'severity' in v
+" 2>/dev/null; then
+    log_pass "JSON violation has rule, file, line, message, severity"
+else
+    log_fail "JSON violation missing fields" "${output:0:200}"
+fi
+
+# JSON violations count matches exit code 2
+result=$(run_ci --format json "$FIXTURES_DIR/invalid-no-strict.php")
+exit_code="${result%%|*}"
+output="${result#*|}"
+violations_count=$(echo "$output" | python3 -c "import json,sys; print(json.load(sys.stdin)['summary']['violations'])" 2>/dev/null || echo "-1")
+if [[ "$exit_code" == "2" && "$violations_count" -gt 0 ]]; then
+    log_pass "JSON summary.violations > 0 when exit code is 2"
+else
+    log_fail "JSON violations count should match exit 2" "exit=$exit_code violations=$violations_count"
+fi
+
+# Clean file: JSON violations array is empty
+result=$(run_ci --format json "$FIXTURES_DIR/valid-entity.php")
+output="${result#*|}"
+violations_count=$(echo "$output" | python3 -c "import json,sys; print(json.load(sys.stdin)['summary']['violations'])" 2>/dev/null || echo "-1")
+if [[ "$violations_count" == "0" ]]; then
+    log_pass "Clean file: JSON violations count is 0"
+else
+    log_fail "Clean file should have 0 violations" "got $violations_count"
+fi
+
+# =============================================================================
+# 4. Text output format tests
+# =============================================================================
+echo ""
+echo "=== Text Output Tests ==="
+
+# Text output header present
+result=$(run_ci --format text "$FIXTURES_DIR/valid-entity.php")
+output="${result#*|}"
+if echo "$output" | grep -q "craftsman-ci"; then
+    log_pass "Text output contains craftsman-ci header"
+else
+    log_fail "Text output should contain header" "${output:0:200}"
+fi
+
+# Text output shows config
+result=$(run_ci --format text "$FIXTURES_DIR/valid-entity.php")
+output="${result#*|}"
+if echo "$output" | grep -qE "Config:.*strict"; then
+    log_pass "Text output shows Config line"
+else
+    log_fail "Text output should show Config" "${output:0:200}"
+fi
+
+# Text output shows file path for violations
+result=$(run_ci --format text "$FIXTURES_DIR/invalid-no-strict.php")
+output="${result#*|}"
+if echo "$output" | grep -q "invalid-no-strict.php"; then
+    log_pass "Text output shows filename for violations"
+else
+    log_fail "Text output should show filename" "${output:0:200}"
+fi
+
+# Text output shows violation summary line
+result=$(run_ci --format text "$FIXTURES_DIR/invalid-no-strict.php")
+output="${result#*|}"
+if echo "$output" | grep -qE "violation|warning"; then
+    log_pass "Text output shows violation summary"
+else
+    log_fail "Text output should show summary line" "${output:0:200}"
+fi
+
+# =============================================================================
+# 5. Config flag tests
+# =============================================================================
+echo ""
+# These assert what --config does, and an environment override outranks a
+# config file by design, so the pin the shared helpers apply is cleared here.
+CLAUDE_PLUGIN_OPTION_strictness=""
+export CLAUDE_PLUGIN_OPTION_strictness
+
+echo "=== --config Flag Tests ==="
+
+# Create temp config file
+TEMP_DIR="/tmp/craftsman-ci-tests-$$"
+mkdir -p "$TEMP_DIR"
+
+# The declared stack does not silence a language pack (#35). These asserted
+# "stack=react skips PHP rules" until the packs stopped being gated by it: a
+# one-line config named the wrong ecosystem and half a polyglot repository was
+# waved through, exit 0, nothing printed.
+cat > "$TEMP_DIR/react-config.yml" <<'YAML'
+strictness: strict
+stack: react
+YAML
+
+result=$(run_ci --format json --config "$TEMP_DIR/react-config.yml" "$FIXTURES_DIR/invalid-no-strict.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]] && [[ "$result" == *PHP001* ]]; then
+    log_pass "--config with stack=react still refuses a PHP file (exit 2, PHP001)"
+else
+    log_fail "--config with stack=react still refuses a PHP file" "got exit $exit_code"
+fi
+
+cat > "$TEMP_DIR/symfony-config.yml" <<'YAML'
+strictness: strict
+stack: symfony
+YAML
+
+result=$(run_ci --format json --config "$TEMP_DIR/symfony-config.yml" "$FIXTURES_DIR/invalid-any.ts")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]] && [[ "$result" == *TS001* ]]; then
+    log_pass "--config with stack=symfony still refuses a TS file (exit 2, TS001)"
+else
+    log_fail "--config with stack=symfony still refuses a TS file" "got exit $exit_code"
+fi
+
+# Config with strictness=relaxed should produce exit 1 (warnings) not exit 2 (violations)
+cat > "$TEMP_DIR/relaxed-config.yml" <<'YAML'
+strictness: relaxed
+stack: fullstack
+YAML
+
+result=$(run_ci --format json --config "$TEMP_DIR/relaxed-config.yml" "$FIXTURES_DIR/invalid-no-strict.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "1" ]]; then
+    log_pass "--config strictness=relaxed converts violations to warnings (exit 1)"
+else
+    log_fail "--config relaxed should exit 1 (warnings)" "got exit $exit_code"
+fi
+
+# Config JSON reflects --config values
+result=$(run_ci --format json --config "$TEMP_DIR/relaxed-config.yml" "$FIXTURES_DIR/valid-entity.php")
+output="${result#*|}"
+stack_val=$(echo "$output" | python3 -c "import json,sys; print(json.load(sys.stdin)['config']['stack'])" 2>/dev/null || echo "")
+strictness_val=$(echo "$output" | python3 -c "import json,sys; print(json.load(sys.stdin)['config']['strictness'])" 2>/dev/null || echo "")
+if [[ "$stack_val" == "fullstack" && "$strictness_val" == "relaxed" ]]; then
+    log_pass "--config values reflected in JSON output (strictness=relaxed, stack=fullstack)"
+else
+    log_fail "--config values should appear in JSON" "stack=$stack_val strictness=$strictness_val"
+fi
+
+rm -rf "$TEMP_DIR"
+
+# =============================================================================
+# 6. Stack filtering via env var tests
+# =============================================================================
+echo ""
+echo "=== Stack via env var does not silence a pack (#35) ==="
+
+export CLAUDE_PLUGIN_OPTION_stack="react"
+result=$(run_ci "$FIXTURES_DIR/invalid-no-strict.php")
+unset CLAUDE_PLUGIN_OPTION_stack
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]] && [[ "$result" == *PHP001* ]]; then
+    log_pass "CLAUDE_PLUGIN_OPTION_stack=react still refuses a PHP file (exit 2, PHP001)"
+else
+    log_fail "CLAUDE_PLUGIN_OPTION_stack=react still refuses a PHP file" "got exit $exit_code"
+fi
+
+export CLAUDE_PLUGIN_OPTION_stack="symfony"
+result=$(run_ci "$FIXTURES_DIR/invalid-any.ts")
+unset CLAUDE_PLUGIN_OPTION_stack
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]] && [[ "$result" == *TS001* ]]; then
+    log_pass "CLAUDE_PLUGIN_OPTION_stack=symfony still refuses a TS file (exit 2, TS001)"
+else
+    log_fail "CLAUDE_PLUGIN_OPTION_stack=symfony still refuses a TS file" "got exit $exit_code"
+fi
+
+# =============================================================================
+# 7. Path scanning tests
+# =============================================================================
+echo ""
+echo "=== Path Scanning Tests ==="
+
+# Scan directory: finds PHP and TS violations
+result=$(run_ci --format json "$FIXTURES_DIR/")
+exit_code="${result%%|*}"
+output="${result#*|}"
+files_scanned=$(echo "$output" | python3 -c "import json,sys; print(json.load(sys.stdin)['summary']['files_scanned'])" 2>/dev/null || echo "0")
+if [[ "$exit_code" == "2" && "$files_scanned" -gt 1 ]]; then
+    log_pass "Directory scan finds violations across multiple files (exit 2, ${files_scanned} files)"
+else
+    log_fail "Directory scan should find multiple files" "exit=$exit_code files=$files_scanned"
+fi
+
+# Scan specific single file path
+result=$(run_ci --format json "$FIXTURES_DIR/valid-entity.php")
+exit_code="${result%%|*}"
+output="${result#*|}"
+files_scanned=$(echo "$output" | python3 -c "import json,sys; print(json.load(sys.stdin)['summary']['files_scanned'])" 2>/dev/null || echo "0")
+if [[ "$exit_code" == "0" && "$files_scanned" == "1" ]]; then
+    log_pass "Specific file path: scans exactly 1 file"
+else
+    log_fail "Specific file scan should report 1 file" "exit=$exit_code files=$files_scanned"
+fi
+
+# Non-existent path: a gate that found nothing has not passed, it has not run.
+# Exiting 0 here is what made a renamed source directory, or a layout the
+# default paths never matched, produce a green pipeline for as long as nobody
+# noticed. secrets-scan.sh guards the same failure with assert_scanner_is_live.
+result=$(run_ci --format json "/nonexistent/path/")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]]; then
+    log_pass "Non-existent path: refuses to pass on an empty scan"
+else
+    log_fail "Non-existent path should exit 2" "got exit $exit_code"
+fi
+
+# =============================================================================
+# 8. Reuse hook fixtures (compatibility check)
+# =============================================================================
+echo ""
+echo "=== Hook Fixture Compatibility Tests ==="
+
+# Hook's valid-entity.php should pass
+result=$(run_ci "$HOOK_FIXTURES/valid-entity.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "Hook fixture valid-entity.php passes craftsman-ci (compatible)"
+else
+    log_fail "Hook valid-entity should pass" "got exit $exit_code"
+fi
+
+# Hook's invalid-no-strict.php should fail
+result=$(run_ci "$HOOK_FIXTURES/invalid-no-strict.php")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]]; then
+    log_pass "Hook fixture invalid-no-strict.php fails craftsman-ci (compatible)"
+else
+    log_fail "Hook invalid-no-strict should fail" "got exit $exit_code"
+fi
+
+# Hook's invalid-any.ts should fail
+result=$(run_ci "$HOOK_FIXTURES/invalid-any.ts")
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "2" ]]; then
+    log_pass "Hook fixture invalid-any.ts fails craftsman-ci (compatible)"
+else
+    log_fail "Hook invalid-any should fail" "got exit $exit_code"
+fi
+
+# Hook's with-craftsman-ignore.php: still uses same logic
+result=$(run_ci "$HOOK_FIXTURES/with-craftsman-ignore.php")
+# craftsman-ci doesn't handle inline craftsman-ignore for file-level rules by default
+# but should still exit consistently
+exit_code="${result%%|*}"
+if [[ "$exit_code" == "0" || "$exit_code" == "1" || "$exit_code" == "2" ]]; then
+    log_pass "Hook fixture with-craftsman-ignore.php handled without crash (exit $exit_code)"
+else
+    log_fail "with-craftsman-ignore should not crash" "got exit $exit_code"
+fi
+
+# =============================================================================
+# 9. CI vs Hooks rule parity tests
+# Verifies that CI output detects the same rules as hooks for identical fixtures
+# =============================================================================
+echo ""
+echo "=== CI/Hooks Parity Tests ==="
+
+# CI detects same PHP rules as hooks on shared fixture
+result=$(run_ci --format json "$HOOK_FIXTURES/invalid-no-strict.php")
+output="${result#*|}"
+ci_rules=$(echo "$output" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+rules = sorted(set(v['rule'] for v in d['violations']))
+print(' '.join(rules))
+" 2>/dev/null || echo "")
+if echo "$ci_rules" | grep -q "PHP001"; then
+    log_pass "CI detects PHP001 on shared hook fixture (parity confirmed)"
+else
+    log_fail "CI should detect PHP001 on hook fixture" "got rules: $ci_rules"
+fi
+
+# CI detects same TS rules as hooks on shared fixture
+result=$(run_ci --format json "$HOOK_FIXTURES/invalid-any.ts")
+output="${result#*|}"
+ci_rules=$(echo "$output" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+rules = sorted(set(v['rule'] for v in d['violations']))
+print(' '.join(rules))
+" 2>/dev/null || echo "")
+if echo "$ci_rules" | grep -q "TS001" && echo "$ci_rules" | grep -q "TS002"; then
+    log_pass "CI detects TS001+TS002 on shared hook fixture (parity confirmed)"
+else
+    log_fail "CI should detect TS001+TS002 on hook fixture" "got rules: $ci_rules"
+fi
+
+# CI detects LAYER001 on shared fixture
+result=$(run_ci --format json "$HOOK_FIXTURES/invalid-layer-violation.php")
+output="${result#*|}"
+ci_rules=$(echo "$output" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+rules = sorted(set(v['rule'] for v in d['violations']))
+print(' '.join(rules))
+" 2>/dev/null || echo "")
+if echo "$ci_rules" | grep -q "LAYER001"; then
+    log_pass "CI detects LAYER001 on shared hook fixture (parity confirmed)"
+else
+    log_fail "CI should detect LAYER001 on hook fixture" "got rules: $ci_rules"
+fi
+
+# =============================================================================
+# 10. Standalone mode (no Claude Code env vars)
+# =============================================================================
+echo ""
+echo "=== Standalone Mode Tests ==="
+
+# Unset all Claude-specific env vars and verify CI still works
+(
+    unset CLAUDE_PLUGIN_ROOT
+    unset CLAUDE_PLUGIN_DATA
+    unset CLAUDE_PLUGIN_OPTION_strictness
+    unset CLAUDE_PLUGIN_OPTION_stack
+    result=$(bash "$CLI" --format json "$FIXTURES_DIR/invalid-no-strict.php" 2>&1)
+    exit_code=$?
+    echo "${exit_code}|${result}"
+)
+# Standalone means no plugin variables, not the developer's real home: with
+# HOME inherited this case read whatever registry cache ~/.claude held
+# (independent verification, 2026-09-15: a poisoned empty cache made it scan
+# zero files and exit 2 for the wrong reason).
+STANDALONE_HOME=$(mktemp -d "${TMPDIR:-/tmp}/craftsman-standalone-home.XXXXXX")
+standalone_result=$( (
+    unset CLAUDE_PLUGIN_ROOT
+    unset CLAUDE_PLUGIN_DATA
+    unset CLAUDE_PLUGIN_OPTION_strictness
+    unset CLAUDE_PLUGIN_OPTION_stack
+    HOME="$STANDALONE_HOME" bash "$CLI" --format json "$FIXTURES_DIR/invalid-no-strict.php" 2>&1
+    echo "EXIT:$?"
+) )
+rm -rf "$STANDALONE_HOME"
+standalone_exit=$(echo "$standalone_result" | grep -oE 'EXIT:[0-9]+' | cut -d: -f2)
+standalone_output=$(echo "$standalone_result" | grep -v 'EXIT:')
+# Exit 2 for the right reason: the rule, not an empty scan.
+if [[ "$standalone_exit" == "2" ]] && echo "$standalone_output" | grep -q '"PHP001"'; then
+    log_pass "Standalone mode: exits 2 on invalid file for PHP001 (no Claude env vars, private HOME)"
+else
+    log_fail "Standalone mode should exit 2 for PHP001" "got exit $standalone_exit: ${standalone_output:0:160}"
+fi
+
+if echo "$standalone_output" | python3 -m json.tool >/dev/null 2>&1; then
+    log_pass "Standalone mode: produces valid JSON output"
+else
+    log_fail "Standalone mode should produce valid JSON" "${standalone_output:0:200}"
+fi
+
+# =============================================================================
+# 11. --help flag test
+# =============================================================================
+echo ""
+echo "=== CLI Interface Tests ==="
+
+result=$(bash "$CLI" --help)
+exit_code=$?
+if [[ "$exit_code" == "0" ]]; then
+    log_pass "--help exits 0"
+else
+    log_fail "--help should exit 0" "got exit $exit_code"
+fi
+
+if echo "$result" | grep -q "craftsman-ci"; then
+    log_pass "--help shows craftsman-ci in output"
+else
+    log_fail "--help should mention craftsman-ci" "${result:0:100}"
+fi
+
+# =============================================================================
+# The pipeline must not disagree with the hooks
+# =============================================================================
+echo ""
+echo "=== No drift between the hooks and the pipeline ==="
+
+# A rule's advisory default is declared once, in its manifest, and nowhere
+# else (#37). The engine and the pipeline each used to carry a hand-written
+# list, kept in step by comparing them to each other, and both were unreachable
+# for every rule a manifest declares: the registry answers first, and without
+# python3 no rule fires at all. Two lists that agree with each other and with
+# nothing else is the drift this section exists to prevent, so the assertion
+# is now against the manifests, through the two real consumers.
+
+# 1. No list came back. A rule id inside either function is a second place to
+#    declare a default, which is the defect.
+_advisory_ids_in() {
+    awk "/^$2\\(\\)/,/^}/" "$1" | grep -v '^\s*#' | grep -oE "[A-Z]{2,}[0-9]{3}" | sort -u | tr '\n' ' '
+}
+ENGINE_LISTED="$(_advisory_ids_in "$ROOT_DIR/hooks/lib/rules-engine.sh" "_rules_is_advisory")"
+CI_LISTED="$(_advisory_ids_in "$ROOT_DIR/ci/craftsman-ci.sh" "_severity_for")"
+# LAYER and SEC are the strictness policy (what `moderate` keeps blocking),
+# not an advisory list, and the pipeline's fallback names them for that.
+CI_LISTED="$(printf '%s' "$CI_LISTED" | tr ' ' '\n' | grep -vE '^(LAYER|SEC)' | tr '\n' ' ')"
+if [[ -z "${ENGINE_LISTED// /}" && -z "${CI_LISTED// /}" ]]; then
+    log_pass "neither the engine nor the pipeline holds a list of advisory rules"
+else
+    log_fail "neither the engine nor the pipeline holds a list of advisory rules" \
+        "engine: '${ENGINE_LISTED}' ci: '${CI_LISTED}' - declare the default in the manifest instead"
+fi
+
+# 2. Every default a manifest declares reaches both front-ends, under strict,
+#    where nothing else could turn a block into a warn.
+source "$ROOT_DIR/hooks/lib/rule-registry.sh" 2>/dev/null || true
+DECLARED_WARN=""
+if type rule_default_severity &>/dev/null 2>&1; then
+    while IFS= read -r _rule; do
+        [[ -z "$_rule" ]] && continue
+        [[ "$(rule_default_severity "$_rule" 2>/dev/null)" == "warn" ]] || continue
+        DECLARED_WARN="${DECLARED_WARN} ${_rule}"
+    done <<< "$(rule_ids 2>/dev/null)"
+fi
+
+if [[ -z "${DECLARED_WARN// /}" ]]; then
+    log_fail "no advisory rule found in the registry" \
+        "the consumer comparison below would pass against an empty set"
+else
+    ENGINE_DISAGREES=""
+    for _rule in $DECLARED_WARN; do
+        _engine_says="$(bash -c "
+            export CLAUDE_PLUGIN_ROOT='$ROOT_DIR' CLAUDE_PLUGIN_OPTION_strictness=strict
+            source '$ROOT_DIR/hooks/lib/rules-engine.sh'
+            source '$ROOT_DIR/hooks/lib/pack-loader.sh'
+            rules_init '$FIXTURES_DIR' /nonexistent-global >/dev/null 2>&1
+            pack_loader_init >/dev/null 2>&1
+            rules_severity '$_rule'" 2>/dev/null)"
+        [[ "$_engine_says" == "warn" ]] || ENGINE_DISAGREES="${ENGINE_DISAGREES} ${_rule}=${_engine_says:-empty}"
+    done
+    if [[ -z "${ENGINE_DISAGREES// /}" ]]; then
+        log_pass "every default a manifest declares advisory resolves to warn in the hooks' engine"
+    else
+        log_fail "every default a manifest declares advisory resolves to warn in the hooks' engine" \
+            "${ENGINE_DISAGREES}"
+    fi
+
+    # The pipeline, through its own front door: a polyglot fixture that trips
+    # several declared-advisory rules, scanned under strict. Every one of them
+    # must come back as a warning, and enough of them must fire for the
+    # assertion to be about something.
+    ADVISORY_REPO="$(mktemp -d "${TMPDIR:-/tmp}/craftsman-advisory.XXXXXX")"
+    mkdir -p "$ADVISORY_REPO/src"
+    cat > "$ADVISORY_REPO/src/Order.php" <<'PHP'
+<?php
+declare(strict_types=1);
+final class Order {
+    private string $name = '';
+    public function setName(string $name): void { $this->name = $name; }
+    public function load(): void {
+        try { $this->name = 'x'; } catch (\Throwable $e) { }
+    }
+    public function all(): string { return "SELECT * FROM orders"; }
+}
+PHP
+    cat > "$ADVISORY_REPO/src/widget.ts" <<'TS'
+export default function widget(input: string | null): string {
+    return input!.trim();
+}
+TS
+    cat > "$ADVISORY_REPO/src/tool.py" <<'PY'
+def load(path):
+    return open(path).read()
+PY
+    ( cd "$ADVISORY_REPO" && git init -q && git add -A ) >/dev/null 2>&1
+    advisory_json="$( cd "$ADVISORY_REPO" && CLAUDE_PLUGIN_OPTION_strictness=strict CLAUDE_PLUGIN_ROOT="$ROOT_DIR" \
+        bash "$CLI" --format json src 2>/dev/null )"
+    rm -rf "$ADVISORY_REPO"
+    advisory_pairs="$(printf '%s' "$advisory_json" | python3 -c "
+import json, sys
+try:
+    report = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+for issue in report.get('violations', []):
+    print(issue.get('rule', ''), issue.get('severity', ''))
+" 2>/dev/null | sort -u)"
+    CI_DISAGREES=""
+    CI_ADVISORY_FIRED=0
+    for _rule in $DECLARED_WARN; do
+        _seen="$(printf '%s\n' "$advisory_pairs" | awk -v r="$_rule" '$1 == r { print $2 }' | sort -u | tr '\n' ',')"
+        [[ -z "$_seen" ]] && continue
+        CI_ADVISORY_FIRED=$((CI_ADVISORY_FIRED + 1))
+        [[ "$_seen" == "warning," ]] || CI_DISAGREES="${CI_DISAGREES} ${_rule}=${_seen}"
+    done
+    if [[ "$CI_ADVISORY_FIRED" -lt 4 ]]; then
+        log_fail "the pipeline reports every declared-advisory rule as a warning" \
+            "only ${CI_ADVISORY_FIRED} advisory rule(s) fired on the fixture, the assertion would be vacuous: $(printf '%s' "$advisory_pairs" | tr '\n' ' ')"
+    elif [[ -z "${CI_DISAGREES// /}" ]]; then
+        log_pass "the pipeline reports every declared-advisory rule as a warning (${CI_ADVISORY_FIRED} fired: $(printf '%s\n' "$advisory_pairs" | awk '$2 == "warning" { print $1 }' | sort -u | tr '\n' ' '))"
+    else
+        log_fail "the pipeline reports every declared-advisory rule as a warning" "${CI_DISAGREES}"
+    fi
+fi
+
+# 3. Adding an advisory rule to a pack is one edit: a manifest nobody in the
+#    engine has heard of declares a new rule warn, and the engine says warn.
+ONE_EDIT="$(mktemp -d "${TMPDIR:-/tmp}/craftsman-one-edit.XXXXXX")"
+mkdir -p "$ONE_EDIT/pack"
+cat > "$ONE_EDIT/pack/pack.yml" <<'YML'
+name: one-edit
+version: "1.0.0"
+description: "a pack that exists only to declare one rule"
+compatibility:
+  core: ">=4.9.0"
+  stack: ["*"]
+rules:
+  owned:
+    - id: ONEEDIT001
+      group: Advisory
+      text: "declared advisory by its manifest alone"
+      default_severity: warn
+    - id: ONEEDIT002
+      group: Advisory
+      text: "declared blocking by its manifest alone"
+      default_severity: block
+YML
+one_edit_out="$(bash -c "
+    export CLAUDE_PLUGIN_ROOT='$ROOT_DIR' CLAUDE_PLUGIN_OPTION_strictness=strict
+    source '$ROOT_DIR/hooks/lib/rules-engine.sh'
+    source '$ROOT_DIR/hooks/lib/rule-registry.sh'
+    rules_init '$FIXTURES_DIR' /nonexistent-global >/dev/null 2>&1
+    rule_registry_init '$ROOT_DIR/rules/core.yml' '$ONE_EDIT/pack/pack.yml'
+    printf '%s %s' \"\$(rules_severity ONEEDIT001)\" \"\$(rules_severity ONEEDIT002)\"" 2>/dev/null)"
+rm -rf "$ONE_EDIT"
+if [[ "$one_edit_out" == "warn block" ]]; then
+    log_pass "a rule declared in a manifest alone resolves to its declared default (one edit)"
+else
+    log_fail "a rule declared in a manifest alone resolves to its declared default (one edit)" \
+        "got '$one_edit_out', expected 'warn block'"
+fi
+
+# A directory-level relaxation the hooks honour must be honoured here too.
+if grep -q "rules_severity_for_file" "$ROOT_DIR/ci/craftsman-ci.sh"; then
+    log_pass "CI resolves severity per file, so .craft-rules.yml applies in the pipeline"
+else
+    log_fail "directory overrides ignored in CI" \
+        "craftsman-ci.sh calls rules_severity without the file, unlike the hooks"
+fi
+
+# =============================================================================
+# The engine is not optional: a CI run without it refuses to give a verdict
+# =============================================================================
+# The libraries under hooks/lib ARE the gate. Sourced under `if [[ -f ]]`, a
+# checkout missing one of them scanned nothing and exited 0: the pipeline
+# reported clean on a repository it never judged. Each required library is
+# removed in turn from a copy of the plugin, and the run must exit 2 naming the
+# file. The control run, on the same copy with nothing removed, must still
+# report the clean fixture as clean, or the test proves only that a broken copy
+# is broken.
+ENGINE_COPY="$(mktemp -d)"
+for _dir in ci hooks packs rules; do
+    cp -R "$ROOT_DIR/$_dir" "$ENGINE_COPY/$_dir"
+done
+
+engine_control=$(bash "$ENGINE_COPY/ci/craftsman-ci.sh" "$FIXTURES_DIR/valid-entity.php" >/dev/null 2>&1; echo $?)
+if [[ "$engine_control" == "0" ]]; then
+    log_pass "control: the plugin copy reports the clean fixture as clean"
+else
+    log_fail "control: the plugin copy reports the clean fixture as clean" \
+        "got exit $engine_control, so the copy is broken and the removals below prove nothing"
+fi
+
+for _lib in config.sh rules-engine.sh pack-loader.sh precedence.sh; do
+    mv "$ENGINE_COPY/hooks/lib/$_lib" "$ENGINE_COPY/hooks/lib/$_lib.away"
+    engine_out=$(bash "$ENGINE_COPY/ci/craftsman-ci.sh" "$FIXTURES_DIR/valid-entity.php" 2>&1)
+    engine_rc=$?
+    mv "$ENGINE_COPY/hooks/lib/$_lib.away" "$ENGINE_COPY/hooks/lib/$_lib"
+    if [[ "$engine_rc" == "2" ]] && echo "$engine_out" | grep -q "$_lib"; then
+        log_pass "hooks/lib/$_lib missing: exit 2, and the message names the file"
+    else
+        log_fail "hooks/lib/$_lib missing must exit 2 naming the file" \
+            "got exit $engine_rc: $(echo "$engine_out" | head -1)"
+    fi
+done
+
+# The second severity authority is gone with the fail-open path: a standalone
+# table in the pipeline answers for rules the manifests own (#37).
+if grep -q "Standalone mode: self-contained config parsing" "$ROOT_DIR/ci/craftsman-ci.sh"; then
+    log_fail "the pipeline still carries a standalone config path" \
+        "a second authority for strictness, reachable only when the engine is absent, which now exits 2"
+else
+    log_pass "no standalone config path: strictness has one authority"
+fi
+
+# One file named three ways is one file. The scan deduplicates on a key that
+# folds `//`, and under bash 3.2, macOS's /bin/bash, the fold kept a
+# backslash: `src//Order.php` became a second file and its findings counted
+# twice (CR-297). /bin/bash runs it where it exists, as on a Mac.
+_spelled_bash=bash
+[[ -x /bin/bash ]] && _spelled_bash=/bin/bash
+mkdir -p "$ENGINE_COPY/spellings/src"
+printf '<?php\nclass Order { public function setN($v) { $this->n = $v; } }\n' \
+    > "$ENGINE_COPY/spellings/src/Order.php"
+spelled_out=$(cd "$ENGINE_COPY/spellings" \
+    && "$_spelled_bash" "$CLI" src/Order.php src//Order.php ./src/Order.php 2>&1)
+assert_contains "one file spelled three ways is scanned once" "$spelled_out" "in 1 file(s)"
+
+rm -rf "$ENGINE_COPY"
+
+# =============================================================================
+# Summary
+# =============================================================================
+test_summary

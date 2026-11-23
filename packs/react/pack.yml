@@ -1,0 +1,123 @@
+name: react
+version: "1.0.0"
+description: "React/TypeScript/JavaScript craftsman pack - React 19, TanStack Query, Tailwind, shadcn/ui"
+compatibility:
+  core: ">=2.4.0"
+  # `*`, not a stack list. Dispatch happens by extension through the language
+  # registry, so a stack list only meant this pack went silent on a repository
+  # whose declared stack named another ecosystem: a .ts file with a known
+  # violation came back clean, exit 0, nothing printed, under `stack: symfony`.
+  # packs/go, packs/rust, packs/bash and packs/ai-ml declare `*` for the same
+  # reason (#35). The stack still selects the doctrine and the setup hints.
+  stack: ["*"]
+
+languages:
+  - id: typescript
+    extensions: [ts, tsx]
+    # literal_syntax: which comment and string syntax the structural ratchet
+    # blanks before measuring, so a control keyword inside a string or a
+    # comment is not a decision point. A closed name the engine knows, never a
+    # list of characters: `quotes: ["'"]` declared on Rust would reproduce the
+    # lifetime bug and nothing would refuse it, while a name can be refused at
+    # compile time. See KNOWN_LITERAL_SYNTAXES in hooks/lib/lang_registry.py.
+    literal_syntax: slash-template
+    entry_markers: [package.json, tsconfig.json]
+    protected_configs: [".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs", ".eslintrc.yml", ".eslintrc.yaml", "eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", ".dependency-cruiser.js", ".dependency-cruiser.json", ".dependency-cruiser.cjs", "dependency-cruiser.config.js"]
+    validators: ["hooks/typescript-validator.sh", "hooks/layer-validator.sh", "hooks/persistence-validator.sh", "hooks/security-validator.sh"]
+    static_analysis: ["static-analysis/eslint.sh"]
+    test_commands: ["jest", "vitest", "npm test", "pnpm test", "yarn test"]
+    # What these runners print on a run that exits 0 having tested nothing,
+    # so that run grants no verification evidence (CR-255). POSIX ERE, matched
+    # per output line; each one was captured from the real runner
+    # (tests/fixtures/test-runs/PROVENANCE.md): an npm or pnpm script that only
+    # echoes, jest and vitest with no test or every test skipped, mocha with
+    # none passing. A focused run (`test.only`) prints what a partial skip
+    # prints, so it is not here.
+    empty_run_markers:
+      - '^> (echo([[:space:]][^&|;]*)?|true|exit 0|:)[[:space:]]*$'
+      - '^No tests found, exiting with code 0'
+      - '^Tests:[[:space:]]+([0-9]+ (skipped|todo), )+[0-9]+ total'
+      - '^No test files found, exiting with code 0'
+      - '^[[:space:]]*Tests[[:space:]]+[0-9]+ (skipped|todo)( [|] [0-9]+ (skipped|todo))* [(][0-9]+[)]'
+      - '^[[:space:]]*0 passing [(]'
+    lsp: "typescript-language-server"
+    metrics_dialect: c-like
+  # JavaScript is claimed so custom rules scoped to it still resolve, but it
+  # declares no validator and no static analysis: the pack's doctrine is
+  # TypeScript, and silently running TS rules on .js would be a scope change.
+  - id: javascript
+    extensions: [js, jsx, mjs, cjs]
+    literal_syntax: slash-template
+    entry_markers: [package.json]
+    protected_configs: [".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs", ".eslintrc.yml", ".eslintrc.yaml", "eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", ".dependency-cruiser.js", ".dependency-cruiser.json", ".dependency-cruiser.cjs", "dependency-cruiser.config.js"]
+    validators: ["hooks/layer-validator.sh", "hooks/persistence-validator.sh", "hooks/security-validator.sh"]
+    static_analysis: ["static-analysis/eslint.sh"]
+    test_commands: ["jest", "vitest", "mocha", "npm test", "pnpm test", "yarn test"]
+    # What these runners print on a run that exits 0 having tested nothing,
+    # so that run grants no verification evidence (CR-255). POSIX ERE, matched
+    # per output line; each one was captured from the real runner
+    # (tests/fixtures/test-runs/PROVENANCE.md): an npm or pnpm script that only
+    # echoes, jest and vitest with no test or every test skipped, mocha with
+    # none passing. A focused run (`test.only`) prints what a partial skip
+    # prints, so it is not here.
+    empty_run_markers:
+      - '^> (echo([[:space:]][^&|;]*)?|true|exit 0|:)[[:space:]]*$'
+      - '^No tests found, exiting with code 0'
+      - '^Tests:[[:space:]]+([0-9]+ (skipped|todo), )+[0-9]+ total'
+      - '^No test files found, exiting with code 0'
+      - '^[[:space:]]*Tests[[:space:]]+[0-9]+ (skipped|todo)( [|] [0-9]+ (skipped|todo))* [(][0-9]+[)]'
+      - '^[[:space:]]*0 passing [(]'
+    metrics_dialect: c-like
+
+rules:
+  # Rules this pack owns: the wording and the default severity that the
+  # exported doctrine and the rules engine both read from here.
+  #
+  # `decision:` is the adjudication a rule received when its ignore rate was
+  # measured (issue #31). It records the verdict and the reason so the next
+  # maintainer does not relitigate it, and it names the paths where the rule is
+  # structurally wrong WITHOUT hardcoding them here: a framework-specific
+  # exclusion baked into pack data is the same mistake as a language list baked
+  # into a hook. The relaxation belongs in the consuming project's
+  # .craft-rules.yml. The registry does not read this key, a human does.
+  owned:
+    - id: TS001
+      group: TypeScript
+      text: "no any - use a precise type or unknown"
+      default_severity: block
+    - id: TS002
+      group: TypeScript
+      text: "no default export - use named exports"
+      default_severity: warn
+      decision: "scoped - a framework resolves route modules, configs and stories by their default export and offers no named alternative, which is where all 22 suppressions landed; the validator already exempts those filenames, and a project relaxes any further convention such as a schema directory in .craft-rules.yml"
+    - id: TS003
+      group: TypeScript
+      text: "no non-null assertion (!) - handle null explicitly"
+      default_severity: warn
+      decision: "advisory - a third-party type whose nullability is wrong is an exception a regex cannot see, and a write blocked on it trains the developer to suppress the rule; set `TS003: block` in .craft-config.yml where the codebase has no such types"
+    - id: WARN-TS001
+      group: Advisory
+      text: "four or more parameters - consider an object"
+      default_severity: warn
+  builtin: ["TS001", "TS002", "TS003", "WARN-TS001", "LAYER001", "NEST001", "LOC001", "GOD001", "PARAM001"]
+  static_analysis: ["ESLINT001", "ESLINT002", "ESLINT003", "ESLINT004"]
+
+hooks:
+  validators: ["hooks/typescript-validator.sh", "hooks/layer-validator.sh", "hooks/persistence-validator.sh", "hooks/security-validator.sh"]
+
+static_analysis:
+  tools: ["static-analysis/eslint.sh"]
+
+commands:
+  scaffold_types: ["component", "hook"]
+
+agents: ["agents/frontend-craftsman.md", "agents/react-reviewer.md"]
+
+knowledge: ["knowledge/"]
+
+templates: ["templates/"]
+
+# Command suggestions this pack contributes to the routing table.
+routes:
+  - trigger: "Scaffold React component, hook, branded type"
+    command: "/craftsman:scaffold"

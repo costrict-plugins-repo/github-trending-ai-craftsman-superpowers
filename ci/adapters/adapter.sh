@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# =============================================================================
+# adapter.sh - Base contract, auto-detection, and unified comment formatter
+#
+# Provides:
+#   adapter_auto_detect()     - detect CI provider from env vars
+#   adapter_load()            - source the appropriate provider adapter
+#   adapter_format_comment()  - generate markdown from JSON report
+#   adapter_print_findings()  - one line per finding, on stdout
+#
+# All provider adapters implement the same contract:
+#   adapter_detect()    - return 0 if running in this CI
+#   adapter_run()       - run craftsman-ci.sh, produce report JSON
+#   adapter_annotate()  - emit provider-specific annotations
+#   adapter_comment()   - post/update PR comment via provider API
+#   adapter_exit()      - compute exit code from report
+# =============================================================================
+set -uo pipefail
+
+ADAPTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CI_DIR="$(dirname "$ADAPTER_DIR")"
+
+# =============================================================================
+# Auto-detection: identify CI provider from environment variables
+# =============================================================================
+# Ask each provider, in priority order, rather than reimplementing its
+# predicate here. adapter_detect is part of the published contract and had no
+# consumer at all: the env-var chain lived in this function, so a provider could
+# have its detection corrected and nothing would change. A contract member
+# nobody calls is a contract member that drifts unnoticed.
+#
+# Each provider is sourced in a subshell: the four define the same five function
+# names, and sourcing them into this shell would leave the last one loaded.
+# jenkins is asked last: a Jenkins build of a repository hosted on GitHub or
+# GitLab exports neither of their CI variables, but the reverse would be a
+# surprise worth catching, and the forge adapters can post a comment where
+# jenkins can only write a file.
+ADAPTER_PROVIDER_PRIORITY=(github gitlab bitbucket jenkins)
+
+adapter_auto_detect() {
+    local provider
+    for provider in "${ADAPTER_PROVIDER_PRIORITY[@]}"; do
+        [[ -f "${ADAPTER_DIR}/${provider}.sh" ]] || continue
+        if ( source "${ADAPTER_DIR}/${provider}.sh" && adapter_detect ) 2>/dev/null; then
+            echo "$provider"
+            return 0
+        fi
+    done
+    echo "generic"
+}
+
+# =============================================================================
+# Loader: source the appropriate adapter, fall back to generic
+# =============================================================================
+adapter_load() {
+    local provider="${1:-}"
+    [[ -z "$provider" ]] && provider=$(adapter_auto_detect)
+
+    if [[ -f "${ADAPTER_DIR}/${provider}.sh" ]]; then
+        source "${ADAPTER_DIR}/${provider}.sh"
+    else
+        source "${ADAPTER_DIR}/generic.sh"
+        provider="generic"
+    fi
+
+    echo "$provider"
+}
+
+# =============================================================================
+# Unified comment formatter: JSON report -> Markdown
+# =============================================================================
+# One parse, not seven, and no default counter. A parse failure used to print
+# zeros, so an unreadable report rendered "Passed, 0 files, 0 violations" while
+# adapter_compute_exit failed the job on the same file (CR-177). The summary is
+# read as strictly as the exit reads it, and a failure is reported as one.
+_adapter_comment_fields() {
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+c = d.get('config', {})
+s = d['summary']
+print(d.get('version', 'unknown'))
+print(c.get('strictness', 'strict'))
+print(c.get('stack', 'fullstack'))
+print(int(s['files_scanned']))
+print(int(s['violations']))
+print(int(s['warnings']))
+print(len(d.get('violations', [])))
+" < "$1" 2>/dev/null
+}
+
+ADAPTER_C_VERSION=""; ADAPTER_C_STRICTNESS=""; ADAPTER_C_STACK=""
+ADAPTER_C_FILES=0; ADAPTER_C_VIOLATIONS=0; ADAPTER_C_WARNINGS=0; ADAPTER_C_ISSUES=0
+
+_adapter_comment_read() {
+    local fields
+    fields=$(_adapter_comment_fields "$1") || return 1
+    {
+        read -r ADAPTER_C_VERSION
+        read -r ADAPTER_C_STRICTNESS
+        read -r ADAPTER_C_STACK
+        read -r ADAPTER_C_FILES
+        read -r ADAPTER_C_VIOLATIONS
+        read -r ADAPTER_C_WARNINGS
+        read -r ADAPTER_C_ISSUES
+    } <<< "$fields"
+}
+
+# Same heading prefix as a verdict, so a forge adapter that updates its earlier
+# comment replaces a stale "Passed" instead of leaving it next to this one.
+_adapter_comment_unreadable() {
+    cat <<'EOF'
+## Craftsman Quality Gate -- Error
+
+The report could not be read, so this run has no verdict and no counter to show. The job fails closed; its log names the report.
+
+EOF
+}
+
+_adapter_comment_footer() {
+    echo "---"
+    echo "*craftsman${1:+ v$1} -- [docs](https://github.com/BULDEE/ai-craftsman-superpowers)*"
+}
+
+# The heading says what the exit decides, asked of the exit's own function. It
+# was recomputed from the two counters, so a report that scanned no file read
+# "Passed" above a job adapter_compute_exit failed with 2 (CR-211).
+_adapter_comment_status() {
+    local exit_code=0
+    adapter_compute_exit "$1" 2>/dev/null || exit_code=$?
+    case "$exit_code" in
+        0) printf 'Passed' ;;
+        1) printf 'Passed with warnings' ;;
+        *) printf 'Failed' ;;
+    esac
+}
+
+# A zero-file run passes only under --changed-only, on a diff with no source
+# file; any other one has not run, and the reader needs to know which.
+_adapter_comment_scope_note() {
+    [[ "$ADAPTER_C_FILES" -eq 0 ]] || return 0
+    if [[ "$1" == "Passed" ]]; then
+        printf 'The diff holds no source file a pack recognises, so there was nothing to validate.\n\n'
+        return 0
+    fi
+    printf 'No source file was scanned, so this run is not a pass. Check the paths the job passes to craftsman-ci.\n\n'
+}
+
+_adapter_comment_header() {
+    local status="$1"
+    cat <<EOF
+## Craftsman Quality Gate -- ${status}
+
+| Metric | Value |
+|--------|-------|
+| Files scanned | ${ADAPTER_C_FILES} |
+| Violations | ${ADAPTER_C_VIOLATIONS} |
+| Warnings | ${ADAPTER_C_WARNINGS} |
+| Rules config | ${ADAPTER_C_STRICTNESS} / ${ADAPTER_C_STACK} |
+
+EOF
+}
+
+_adapter_comment_issue_table() {
+    echo "### Issues"
+    echo ""
+    echo "| Rule | File | Line | Message | Severity |"
+    echo "|------|------|------|---------|----------|"
+    python3 -c "
+import json, sys
+for v in json.load(sys.stdin).get('violations', []):
+    print('| \`%s\` | \`%s\` | %s | %s | %s |' % (
+        v.get('rule', ''), v.get('file', ''), v.get('line', 0),
+        v.get('message', ''), v.get('severity', '')))
+" < "$1" 2>/dev/null
+    echo ""
+}
+
+# adapter_print_findings <report> - one line per finding, on stdout.
+#
+# The console form every provider falls back to. It lived in generic.sh, where
+# it was the only console output an unsupported CI got; jenkins.sh needs the
+# same thing next to its Checkstyle report, for a build whose Warnings NG step
+# is absent. One implementation, so the two cannot drift into printing the same
+# findings in two shapes.
+adapter_print_findings() {
+    local report_file="$1"
+
+    [[ ! -f "$report_file" ]] && return 0
+
+    python3 -c "
+import json, sys
+report = json.load(sys.stdin)
+for v in report.get('violations', []):
+    sev = v.get('severity', 'warning').upper()
+    f = v.get('file', '')
+    line = v.get('line', 0)
+    rule = v.get('rule', '')
+    msg = v.get('message', '')
+    print(f'{sev}: {f}:{line} [{rule}] {msg}')
+" < "$report_file" 2>/dev/null
+}
+
+adapter_format_comment() {
+    local report_file="$1"
+
+    if [[ ! -f "$report_file" ]]; then
+        echo "Error: report file not found: $report_file" >&2
+        return 1
+    fi
+
+    if ! _adapter_comment_read "$report_file"; then
+        _adapter_comment_unreadable
+        _adapter_comment_footer ""
+        return 0
+    fi
+    local status
+    status=$(_adapter_comment_status "$report_file")
+    _adapter_comment_header "$status"
+    _adapter_comment_scope_note "$status"
+    [[ "$ADAPTER_C_ISSUES" -gt 0 ]] && _adapter_comment_issue_table "$report_file"
+
+    _adapter_comment_footer "$ADAPTER_C_VERSION"
+    return 0
+}
+
+# =============================================================================
+# Exit code helper: shared logic for all adapters
+# =============================================================================
+# All three counts in one parse, so an unreadable report is distinguishable from
+# a clean one. Defaulting a parse failure to zero was a fail-open: the adapters
+# merge the scanner's stderr into this file, so anything that writes a warning,
+# including a malformed rule in the audited repository's own .craft-config.yml,
+# produced "0 violations" and a green gate.
+_adapter_summary_counts() {
+    python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+s = d['summary']
+changed = 1 if d.get('scope', {}).get('changed_only') is True else 0
+print(int(s['violations']), int(s['warnings']), int(s['files_scanned']), changed)
+" < "$1" 2>/dev/null
+}
+
+# files_scanned is read as well as the two counts because a gate that opened no
+# file has not passed, it has not run. craftsman-ci.sh already refuses that run
+# with exit 2, but every adapter_run ends in `|| true` and the verdict was
+# recomputed here from the violation count alone, which cannot tell "clean" from
+# "never ran": the guard held in direct mode and was discarded in the only mode
+# the shipped templates use.
+adapter_compute_exit() {
+    local report_file="$1"
+
+    local summary
+    if ! summary=$(_adapter_summary_counts "$report_file"); then
+        echo "craftsman-ci: report is not valid JSON, failing closed: $report_file" >&2
+        echo "craftsman-ci: first line was: $(head -1 "$report_file" 2>/dev/null)" >&2
+        return 2
+    fi
+
+    local violations warnings files_scanned changed_only
+    read -r violations warnings files_scanned changed_only <<< "$summary"
+
+    # Under --changed-only an empty scan is a statement, not a failure: the
+    # diff holds no file a pack recognises. craftsman-ci.sh already exits 0
+    # on it in direct mode; this is the mode the templates run.
+    if [[ "$files_scanned" -eq 0 && "${changed_only:-0}" -eq 1 ]]; then
+        echo "craftsman-ci: --changed-only found no source file in the diff. Nothing to validate." >&2
+        return 0
+    fi
+    if [[ "$files_scanned" -eq 0 ]]; then
+        echo "craftsman-ci: no file was scanned, so this is not a pass: $report_file" >&2
+        return 2
+    fi
+
+    [[ "$violations" -gt 0 ]] && return 2
+    [[ "$warnings" -gt 0 ]] && return 1
+    return 0
+}

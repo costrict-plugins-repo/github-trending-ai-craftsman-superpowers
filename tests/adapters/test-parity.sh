@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Host adapter parity (ADR-0029).
+#
+# One rules engine, one verdict: for the same file under the same rule set,
+# every front-end resolves the same rule ids to the same blocking decision.
+# The fixtures run through the three front-ends that exist today: the Claude
+# Code hooks, ci/craftsman-ci.sh, and the Hermes pre_verify adapter. A new
+# directory under adapters/ that this suite does not cover fails the last
+# assertion: an adapter without parity coverage is a fork, not an adapter.
+# =============================================================================
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$SCRIPT_DIR/../lib/test-helpers.sh"
+
+export CLAUDE_PLUGIN_ROOT="$ROOT_DIR"
+export CLAUDE_PLUGIN_DATA="${TMPDIR:-/tmp}/craftsman-parity-$$"
+export CLAUDE_PLUGIN_OPTION_stack="fullstack"
+export CLAUDE_PLUGIN_OPTION_strictness="strict"
+mkdir -p "$CLAUDE_PLUGIN_DATA"
+
+HERMES_HOOK="$ROOT_DIR/adapters/hermes/pre-verify.sh"
+WRITE_GATE="$ROOT_DIR/adapters/hermes/pre-tool-call.sh"
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/craftsman-parity.XXXXXX")
+PREV_PWD="$PWD"
+
+echo ""
+echo "=== host adapter parity (ADR-0029) ==="
+
+mkdir -p "$WORK/src/Domain/User" "$WORK/relaxed"
+cd "$WORK" && git init -q . 2>/dev/null
+printf 'rules:\n  TS001: ignore\n' > relaxed/.craft-rules.yml
+git add -A >/dev/null 2>&1
+git -c user.email=t@t -c user.name=t commit -qm base >/dev/null 2>&1
+
+_hermes() {
+    python3 -c '
+import json, sys
+print(json.dumps({"hook_event_name": "pre_verify", "session_id": "s1",
+                  "cwd": sys.argv[1],
+                  "extra": {"changed_paths": [], "coding": True, "attempt": 0}}))' "$WORK" \
+        | bash "$HERMES_HOOK" 2>/dev/null
+}
+
+# The opt-in write gate, on the content before it is written: stdout|rc.
+_write_gate() {
+    local out rc
+    out=$(python3 -c '
+import json, sys
+print(json.dumps({"tool_name": "write_file", "args": {"path": sys.argv[1], "content": sys.argv[2]}}))' \
+        "$1" "$2" | bash "$WRITE_GATE" 2>/dev/null); rc=$?
+    printf '%s|%s' "$out" "$rc"
+}
+
+# The Copilot adapter, on the documented PascalCase envelope (`create` for a
+# Write): stdout|rc, like the Hermes write gate.
+COPILOT_PRE="$ROOT_DIR/adapters/copilot/pre-tool-use.sh"
+COPILOT_POST="$ROOT_DIR/adapters/copilot/post-tool-use.sh"
+_copilot_pre() {
+    local out rc
+    out=$(python3 -c '
+import json, sys
+print(json.dumps({"hook_event_name": "PreToolUse", "session_id": "cp1", "timestamp": "2026-09-15T00:00:00Z", "cwd": sys.argv[3],
+                  "tool_name": "create", "tool_input": {"path": sys.argv[1], "file_text": sys.argv[2]}}))' \
+        "$1" "$2" "$WORK" | bash "$COPILOT_PRE" 2>/dev/null); rc=$?
+    printf '%s|%s' "$out" "$rc"
+}
+_copilot_post() {
+    local out rc
+    out=$(python3 -c '
+import json, sys
+print(json.dumps({"hook_event_name": "PostToolUse", "session_id": "cp1", "timestamp": "2026-09-15T00:00:00Z", "cwd": sys.argv[2],
+                  "tool_name": "create", "tool_input": {"path": sys.argv[1]}, "tool_result": {"result_type": "success", "text_result_for_llm": ""}}))' \
+        "$1" "$WORK" | bash "$COPILOT_POST" 2>/dev/null); rc=$?
+    printf '%s|%s' "$out" "$rc"
+}
+
+_ci_rules_for() {
+    bash "$ROOT_DIR/ci/craftsman-ci.sh" --format json "$1" 2>/dev/null | python3 -c '
+import json, sys
+report = json.load(sys.stdin)
+for v in report.get("violations") or []:
+    print(v.get("rule"), v.get("severity"))'
+}
+
+_clean() { git checkout -q -- . 2>/dev/null; git clean -qfd 2>/dev/null; mkdir -p src relaxed; }
+
+# --- LAYER001, critical, enforced pre-write -------------------------------
+PHP_FILE="$WORK/src/Domain/User/User.php"
+PHP_CONTENT='<?php
+declare(strict_types=1);
+namespace App\Domain\User;
+use App\Infrastructure\Persistence\DoctrineUserRepository;
+final class User {}'
+
+RC=0
+HOOK_OUT=$(python3 -c '
+import json, sys
+print(json.dumps({"tool_input": {"file_path": sys.argv[1], "content": sys.argv[2]}}))' \
+    "$PHP_FILE" "$PHP_CONTENT" | bash "$ROOT_DIR/hooks/pre-write-check.sh" 2>&1) || RC=$?
+GATE_OUT=$(_write_gate "$PHP_FILE" "$PHP_CONTENT")
+COPILOT_OUT=$(_copilot_pre "$PHP_FILE" "$PHP_CONTENT")
+printf '%s' "$PHP_CONTENT" > "$PHP_FILE"
+CI_OUT=$(_ci_rules_for "src/Domain/User/User.php")
+HERMES_OUT=$(_hermes)
+if [[ "$RC" -eq 2 ]] && printf '%s' "$HOOK_OUT" | grep -q "LAYER001" \
+    && printf '%s' "$CI_OUT" | grep -q "^LAYER001 critical" \
+    && printf '%s' "$HERMES_OUT" | grep -q '"decision"' \
+    && printf '%s' "$HERMES_OUT" | grep -q "LAYER001" \
+    && [[ "${GATE_OUT##*|}" == "2" ]] && printf '%s' "${GATE_OUT%|*}" | grep -q "LAYER001" \
+    && [[ "${COPILOT_OUT##*|}" == "2" ]] && printf '%s' "${COPILOT_OUT%|*}" | grep -q '"deny"'; then
+    log_pass "LAYER001 blocks identically in hooks, CI, Hermes, the Hermes write gate and the Copilot adapter"
+else
+    log_fail "LAYER001 parity" "hook rc=$RC ci=[$CI_OUT] hermes=[$HERMES_OUT] gate=[$GATE_OUT] copilot=[$COPILOT_OUT]"
+fi
+_clean
+
+# --- TS001, critical, enforced post-write ---------------------------------
+printf 'const bad: any = 1;\n' > "$WORK/src/Bad.ts"
+RC=0
+HOOK_OUT=$(printf '{"tool_input":{"file_path":"%s"}}' "$WORK/src/Bad.ts" \
+    | bash "$ROOT_DIR/hooks/post-write-check.sh" 2>&1) || RC=$?
+CI_OUT=$(_ci_rules_for "src/Bad.ts")
+HERMES_OUT=$(_hermes)
+COPILOT_OUT=$(_copilot_post "$WORK/src/Bad.ts")
+if [[ "$RC" -eq 2 ]] && printf '%s' "$HOOK_OUT" | grep -q "TS001" \
+    && printf '%s' "$CI_OUT" | grep -q "^TS001 critical" \
+    && printf '%s' "$HERMES_OUT" | grep -q '"decision"' \
+    && printf '%s' "$HERMES_OUT" | grep -q "TS001" \
+    && [[ "${COPILOT_OUT##*|}" == "2" ]] && printf '%s' "${COPILOT_OUT%|*}" | grep -q "TS001"; then
+    log_pass "TS001 blocks identically in hooks, CI, Hermes and the Copilot adapter"
+else
+    log_fail "TS001 parity" "hook rc=$RC ci=[$CI_OUT] hermes=[$HERMES_OUT] copilot=[$COPILOT_OUT]"
+fi
+_clean
+
+# --- TS002, advisory: reported everywhere, blocks nowhere -----------------
+printf 'export default function f() { return 1 }\n' > "$WORK/src/Warn.ts"
+RC=0
+HOOK_OUT=$(printf '{"tool_input":{"file_path":"%s"}}' "$WORK/src/Warn.ts" \
+    | bash "$ROOT_DIR/hooks/post-write-check.sh" 2>&1) || RC=$?
+CI_OUT=$(_ci_rules_for "src/Warn.ts")
+HERMES_OUT=$(_hermes)
+if [[ "$RC" -eq 0 ]] \
+    && printf '%s' "$CI_OUT" | grep -q "^TS002" \
+    && ! printf '%s' "$CI_OUT" | grep -q "^TS002 critical" \
+    && [[ -n "$HERMES_OUT" ]] \
+    && ! printf '%s' "$HERMES_OUT" | grep -q '"decision"' \
+    && printf '%s' "$HERMES_OUT" | grep -q "TS002"; then
+    log_pass "TS002 stays advisory in hooks, CI and Hermes"
+else
+    log_fail "TS002 parity" "hook rc=$RC ci=[$CI_OUT] hermes=[$HERMES_OUT]"
+fi
+_clean
+
+# --- directory relaxation applies in every front-end ----------------------
+printf 'const relaxed: any = 1;\n' > "$WORK/relaxed/Bad.ts"
+RC=0
+HOOK_OUT=$(printf '{"tool_input":{"file_path":"%s"}}' "$WORK/relaxed/Bad.ts" \
+    | bash "$ROOT_DIR/hooks/post-write-check.sh" 2>&1) || RC=$?
+CI_OUT=$(_ci_rules_for "relaxed/Bad.ts")
+HERMES_OUT=$(_hermes)
+# The write gate judges SEC001 and LAYER001 only, so its relaxation case
+# is a Domain file under a directory that relaxes LAYER001.
+mkdir -p "$WORK/relaxed/Domain"
+printf 'rules:\n  TS001: ignore\n  LAYER001: warn\n' > "$WORK/relaxed/.craft-rules.yml"
+GATE_OUT=$(_write_gate "$WORK/relaxed/Domain/Legacy.php" "$PHP_CONTENT")
+COPILOT_OUT=$(_copilot_post "$WORK/relaxed/Bad.ts")
+if [[ "$RC" -eq 0 ]] \
+    && ! printf '%s' "$CI_OUT" | grep -q "^TS001" \
+    && [[ -z "$HERMES_OUT" ]] \
+    && [[ "${GATE_OUT##*|}" == "0" && -z "${GATE_OUT%|*}" ]] \
+    && [[ "${COPILOT_OUT##*|}" == "0" ]] && ! printf '%s' "${COPILOT_OUT%|*}" | grep -q "TS001"; then
+    log_pass "a directory .craft-rules.yml relaxation holds in hooks, CI, Hermes, the Hermes write gate and the Copilot adapter"
+else
+    log_fail "relaxation parity" "hook rc=$RC ci=[$CI_OUT] hermes=[$HERMES_OUT] gate=[$GATE_OUT] copilot=[$COPILOT_OUT]"
+fi
+_clean
+
+# --- a directory relaxation holds pre-write too ---------------------------
+#
+# pre-write-check.sh resolved severity through config.sh's strictness table
+# and a hand-kept advisory list, never through rules_severity_for_file: the
+# same file, same rule and same .craft-rules.yml gave "BLOCKED" before the
+# write and nothing after it, two verdicts inside one front-end, and this
+# suite ran the relaxation case through post-write only.
+mkdir -p "$WORK/src/Domain/User"
+printf 'rules:\n  LAYER001: warn\n' > "$WORK/src/Domain/.craft-rules.yml"
+RC=0
+HOOK_OUT=$(python3 -c '
+import json, sys
+print(json.dumps({"tool_input": {"file_path": sys.argv[1], "content": sys.argv[2]}}))' \
+    "$PHP_FILE" "$PHP_CONTENT" | bash "$ROOT_DIR/hooks/pre-write-check.sh" 2>&1) || RC=$?
+printf '%s' "$PHP_CONTENT" > "$PHP_FILE"
+CI_OUT=$(_ci_rules_for "src/Domain/User/User.php")
+if [[ "$RC" -eq 0 ]] && printf '%s' "$HOOK_OUT" | grep -q "PRE-WRITE WARNING" \
+    && printf '%s' "$HOOK_OUT" | grep -q "LAYER001" \
+    && printf '%s' "$CI_OUT" | grep -q "^LAYER001 warning"; then
+    log_pass "a directory .craft-rules.yml demotion holds pre-write as it holds in CI"
+else
+    log_fail "pre-write relaxation parity" "hook rc=$RC out=[$(printf '%s' "$HOOK_OUT" | tr '\n' ' ' | cut -c1-120)] ci=[$CI_OUT]"
+fi
+rm -f "$WORK/src/Domain/.craft-rules.yml"
+_clean
+
+# --- a secret cannot be silenced with a marker, on any front-end ----------
+#
+# An ignore marker naming SEC001 on the line made a hardcoded secret pass the
+# hook, the pipeline and the Hermes write gate whose README says "No escape is
+# offered for a secret" (guardrail review, H1 and E10b). The baseline already
+# refused to hold SEC* (rule-baseline.sh); the marker is the same class of
+# escape. rules/core.yml declares the rule never_ignorable, and every marker
+# reader asks the registry before honouring one.
+mkdir -p "$WORK/src"
+SECRET_FILE="$WORK/src/Pay.php"
+SECRET_CONTENT="<?php
+declare(strict_types=1);
+final class Pay
+{
+    // craftsman-ignore: SEC001
+    private string \$password = 'correct-horse-battery-staple-9';
+}"
+printf '%s\n' "$SECRET_CONTENT" > "$SECRET_FILE"
+RC=0
+HOOK_OUT=$(printf '{"tool_input":{"file_path":"%s"}}' "$SECRET_FILE" \
+    | bash "$ROOT_DIR/hooks/post-write-check.sh" 2>&1) || RC=$?
+CI_OUT=$(_ci_rules_for "src/Pay.php")
+GATE_OUT=$(_write_gate "$SECRET_FILE" "$SECRET_CONTENT")
+if [[ "$RC" -eq 2 ]] && printf '%s' "$HOOK_OUT" | grep -q "SEC001" \
+    && printf '%s' "$CI_OUT" | grep -q "^SEC001 critical" \
+    && printf '%s' "$GATE_OUT" | grep -q "SEC001"; then
+    log_pass "an ignore marker on SEC001 silences nothing: hook, CI and the write gate all refuse the secret"
+else
+    log_fail "a secret with an ignore marker is refused everywhere" "hook rc=$RC ci=[$CI_OUT] gate=[$(printf '%s' "$GATE_OUT" | tr '\n' ' ' | cut -c1-80)]"
+fi
+_clean
+
+# --- one global layer, read by the hooks and CI, ignored by the gates ------
+#
+# The pipeline read `$HOME/.craft-config.yml` and the hooks
+# `~/.claude/.craft-config.yml`, the documented location: a global
+# `PHP002: warn` applied at the keyboard and not in CI (architecture review,
+# BLOCKING 3). One resolver now, `rules_global_dir`. And a gate an agent runs
+# under must not read a layer the same uid can write outside the gated turn:
+# the Hermes adapter sets CRAFTSMAN_GLOBAL_CONFIG_DIR to nothing, so a
+# `strictness: relaxed` in the operator's home cannot degrade the verdict
+# (guardrail review, H5b).
+GLOBAL_HOME=$(mktemp -d "${TMPDIR:-/tmp}/craftsman-global-home.XXXXXX")
+mkdir -p "$GLOBAL_HOME/.claude" "$WORK/src/Domain/User"
+printf 'rules:\n  PHP002: warn\n' > "$GLOBAL_HOME/.claude/.craft-config.yml"
+LOOSE_FILE="$WORK/src/Domain/User/Loose.php"
+printf '<?php\ndeclare(strict_types=1);\nnamespace App\\Domain\\User;\nclass Loose {}\n' > "$LOOSE_FILE"
+RC=0
+HOOK_OUT=$(printf '{"tool_input":{"file_path":"%s"}}' "$LOOSE_FILE" \
+    | HOME="$GLOBAL_HOME" bash "$ROOT_DIR/hooks/post-write-check.sh" 2>&1) || RC=$?
+CI_OUT=$(HOME="$GLOBAL_HOME" _ci_rules_for "src/Domain/User/Loose.php")
+HERMES_OUT=$(HOME="$GLOBAL_HOME" _hermes)
+if [[ "$RC" -eq 0 ]] && printf '%s' "$HOOK_OUT" | grep -q "PHP002" \
+    && printf '%s' "$CI_OUT" | grep -q "^PHP002 warning"; then
+    log_pass "a global ~/.claude/.craft-config.yml demotion holds in the hook and in CI alike"
+else
+    log_fail "global layer parity hook/CI" "hook rc=$RC ci=[$CI_OUT]"
+fi
+if printf '%s' "$HERMES_OUT" | grep -q '"decision"' && printf '%s' "$HERMES_OUT" | grep -q "PHP002"; then
+    log_pass "and the Hermes gate ignores the operator's home layer: PHP002 still blocks the turn"
+else
+    log_fail "the Hermes gate ignores the operator's home layer" "hermes=[$(printf '%s' "$HERMES_OUT" | tr '\n' ' ' | cut -c1-120)]"
+fi
+rm -rf "$GLOBAL_HOME"
+_clean
+
+# --- a custom rule: one verdict before the write, after it and in CI ------
+#
+# A long-form rule (a pattern in .craft-config.yml) ran in post-write and in
+# the pipeline, never before the write: `severity: block` refused the file
+# once it had landed and let the write itself through (CR-171, measured
+# pre-write 0, post-write 2, CI 2). A post hook can report a file on disk, it
+# cannot take the write back. The three front-ends run the engine's one pass
+# now, and the ignore case doubles as the control: the file is otherwise
+# clean, so a refusal anywhere else is the custom rule's.
+CUSTOM_FILE="$WORK/src/Runner.php"
+CUSTOM_CONTENT='<?php
+
+declare(strict_types=1);
+
+namespace App;
+
+final class Runner
+{
+    public function run(): void
+    {
+        forbidden_call();
+    }
+}'
+_ci_custom_for() {
+    bash "$ROOT_DIR/ci/craftsman-ci.sh" --format json "$1" 2>/dev/null | python3 -c '
+import json, sys
+report = json.load(sys.stdin)
+for v in report.get("violations") or []:
+    if v.get("rule") == "CUSTOM171":
+        print(v.get("severity"), v.get("line"), v.get("message"))'
+}
+for CUSTOM_SEV in block warn ignore; do
+    printf '%s\n' 'rules:' '  CUSTOM171:' '    pattern: "forbidden_call\\("' \
+        '    message: "forbidden_call() is not allowed"' "    severity: ${CUSTOM_SEV}" \
+        '    languages: [php]' > "$WORK/.craft-config.yml"
+    PRE_RC=0
+    PRE_OUT=$(python3 -c '
+import json, sys
+print(json.dumps({"tool_name": "Write", "tool_input": {"file_path": sys.argv[1], "content": sys.argv[2]}}))' \
+        "$CUSTOM_FILE" "$CUSTOM_CONTENT" | bash "$ROOT_DIR/hooks/pre-write-check.sh" 2>&1) || PRE_RC=$?
+    printf '%s\n' "$CUSTOM_CONTENT" > "$CUSTOM_FILE"
+    POST_RC=0
+    POST_OUT=$(printf '{"tool_input":{"file_path":"%s"}}' "$CUSTOM_FILE" \
+        | bash "$ROOT_DIR/hooks/post-write-check.sh" 2>&1) || POST_RC=$?
+    CI_OUT=$(_ci_custom_for "src/Runner.php")
+    case "$CUSTOM_SEV" in
+        block)  WANT_RC=2; WANT_CI="critical 11 forbidden_call() is not allowed" ;;
+        warn)   WANT_RC=0; WANT_CI="warning 11 forbidden_call() is not allowed" ;;
+        ignore) WANT_RC=0; WANT_CI="" ;;
+    esac
+    PRE_SAW=no; POST_SAW=no
+    printf '%s' "$PRE_OUT" | grep -q "CUSTOM171" && PRE_SAW=yes
+    printf '%s' "$POST_OUT" | grep -q "CUSTOM171" && POST_SAW=yes
+    WANT_SAW=yes; [[ "$CUSTOM_SEV" == "ignore" ]] && WANT_SAW=no
+    if [[ "$PRE_RC" -eq "$WANT_RC" && "$POST_RC" -eq "$WANT_RC" \
+          && "$PRE_SAW" == "$WANT_SAW" && "$POST_SAW" == "$WANT_SAW" && "$CI_OUT" == "$WANT_CI" ]]; then
+        log_pass "custom rule at ${CUSTOM_SEV}: pre-write, post-write and CI give one verdict (exit ${WANT_RC})"
+    else
+        log_fail "custom rule parity at ${CUSTOM_SEV}" "pre rc=$PRE_RC saw=$PRE_SAW post rc=$POST_RC saw=$POST_SAW ci=[$CI_OUT], want rc=$WANT_RC saw=$WANT_SAW ci=[$WANT_CI]"
+    fi
+    _clean
+done
+
+# --- every adapter directory is covered here ------------------------------
+UNCOVERED=""
+for dir in "$ROOT_DIR"/adapters/*/; do
+    case "$(basename "$dir")" in
+        hermes|copilot) ;;
+        *) UNCOVERED="${UNCOVERED}$(basename "$dir") " ;;
+    esac
+done
+if [[ -z "$UNCOVERED" ]]; then
+    log_pass "every adapters/ directory has parity coverage in this suite"
+else
+    log_fail "uncovered adapter" "add parity cases for: $UNCOVERED"
+fi
+
+cd "$PREV_PWD"
+rm -rf "$WORK" "$CLAUDE_PLUGIN_DATA"
+
+test_summary
